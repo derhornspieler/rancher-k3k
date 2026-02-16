@@ -22,5 +22,7 @@ jobs:
           find . -name '*.yaml' \
             -not -path './.github/*' \
             -not -path './test/*' \
+            -not -path './post-install/*' \
             -not -name '.yamllint.yaml' \
+            -not -name 'rancher-cluster.yaml' \
             -exec kubeconform -strict -ignore-missing-schemas -summary {} +

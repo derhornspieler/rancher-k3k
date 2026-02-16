@@ -11,6 +11,7 @@ Deploy Rancher management server using [k3k](https://github.com/rancher/k3k) (Ku
 ```
 
 The script prompts for hostname and password, then handles everything:
+
 1. Installs k3k controller
 2. Creates the virtual cluster (configurable storage)
 3. Deploys cert-manager + Rancher inside it
@@ -21,7 +22,7 @@ The script prompts for hostname and password, then handles everything:
 
 ## Architecture
 
-```
+```text
 External Traffic
   → rancher.example.com (Harvester VIP)
     → nginx ingress (host cluster, rancher-k3k namespace)
@@ -30,7 +31,7 @@ External Traffic
           → Rancher (cattle-system namespace)
 ```
 
-```
+```text
 ┌──────────────────────────────────────────────────────┐
 │  Harvester Host Cluster                              │
 │  ┌────────────────────────────────────────────────┐  │
@@ -82,7 +83,7 @@ After a Harvester upgrade, re-run `deploy.sh` or manually re-apply `host-ingress
 
 When `k3k-rancher-server-0` is evicted during a node drain and rescheduled to a different node, flannel's persisted network state in the PVC no longer matches the new pod IP, causing:
 
-```
+```text
 level=fatal msg="Failed to start networking: unable to initialize network policy controller:
   error getting node subnet: failed to find interface with specified node ip"
 ```
@@ -178,6 +179,7 @@ After deploying Rancher and completing the UI bootstrap:
 ```
 
 The script:
+
 1. Extracts the k3k virtual cluster kubeconfig (`kubeconfig-k3k.yaml`)
 2. Authenticates to the Rancher API and creates a persistent API token
 3. Detects an imported Harvester cluster and generates its kubeconfig (`kubeconfig-harvester.yaml`)
@@ -209,7 +211,7 @@ resource "rancher2_cloud_credential" "harvester" {
 
 ## File Structure
 
-```
+```text
 rancher-k3k/
 ├── deploy.sh                # Automated 9-step deployment script
 ├── destroy.sh               # Teardown with monitoring and verification
@@ -240,6 +242,7 @@ A single credential pair is used for all three repos (cert-manager, Rancher, k3k
 The password is read with hidden input.
 
 The script propagates auth in two ways:
+
 - **Host cluster**: `helm repo add` receives `--username`/`--password` flags
 - **k3k cluster**: A `kubernetes.io/basic-auth` Secret (`helm-repo-auth`) is
   created in `kube-system`. The HelmChart CRs reference it via `spec.authSecret`.
@@ -250,6 +253,7 @@ If your repos or registries use TLS certificates signed by an internal CA,
 provide the path to the PEM-encoded CA bundle when prompted.
 
 The CA is propagated to:
+
 - **Host cluster**: `helm repo add` and `helm install` receive `--ca-file`
 - **k3k cluster (Rancher)**: A Secret (`tls-ca`) in `cattle-system` for
   Rancher's `privateCA` setting
@@ -368,21 +372,26 @@ kubectl delete ns rancher-k3k k3k-system
 ## Troubleshooting
 
 ### Cluster not starting
+
 ```bash
 kubectl logs -n k3k-system deployment/k3k
 kubectl describe clusters.k3k.io rancher -n rancher-k3k
 ```
 
 ### Rancher image pull fails (no space)
+
 The default 10Gi PVC should be sufficient. If not, delete the cluster,
 increase `storageRequestSize` in rancher-cluster.yaml, and redeploy.
 
 ### x509 certificate error on cluster import
+
 The TLS certificate was not copied from the k3k cluster to the host cluster.
 Re-run the TLS copy step (Step 5 in manual installation, or re-run deploy.sh).
 
 ### cattle-cluster-agent can't reach Rancher
+
 Verify DNS resolution and connectivity from within the host cluster:
+
 ```bash
 kubectl run test --image=curlimages/curl --rm -it --restart=Never -- \
     curl -sk https://<hostname>/ping
