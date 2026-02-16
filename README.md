@@ -1,5 +1,12 @@
 # rancher-k3k
 
+[![ShellCheck](https://github.com/derhornspieler/rancher-k3k/actions/workflows/shellcheck.yaml/badge.svg)](https://github.com/derhornspieler/rancher-k3k/actions/workflows/shellcheck.yaml)
+[![yamllint](https://github.com/derhornspieler/rancher-k3k/actions/workflows/yamllint.yaml/badge.svg)](https://github.com/derhornspieler/rancher-k3k/actions/workflows/yamllint.yaml)
+[![Kubeconform](https://github.com/derhornspieler/rancher-k3k/actions/workflows/kubeconform.yaml/badge.svg)](https://github.com/derhornspieler/rancher-k3k/actions/workflows/kubeconform.yaml)
+[![Gitleaks](https://github.com/derhornspieler/rancher-k3k/actions/workflows/gitleaks.yaml/badge.svg)](https://github.com/derhornspieler/rancher-k3k/actions/workflows/gitleaks.yaml)
+[![markdownlint](https://github.com/derhornspieler/rancher-k3k/actions/workflows/markdownlint.yaml/badge.svg)](https://github.com/derhornspieler/rancher-k3k/actions/workflows/markdownlint.yaml)
+[![actionlint](https://github.com/derhornspieler/rancher-k3k/actions/workflows/actionlint.yaml/badge.svg)](https://github.com/derhornspieler/rancher-k3k/actions/workflows/actionlint.yaml)
+
 Deploy Rancher management server using [k3k](https://github.com/rancher/k3k) (Kubernetes in Kubernetes) on Harvester.
 
 > **Warning**: This addon is experimental and not for production use.
