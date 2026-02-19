@@ -90,10 +90,14 @@ CA_KEY_PATH=""
 # =============================================================================
 
 # Registry host for pull-through cache (e.g. harbor.example.com)
-# Generates containerd mirrors for: docker.io, quay.io, ghcr.io,
-# registry.k8s.io, gcr.io, docker.elastic.co
 # Requires matching proxy cache projects in Harbor.
 PRIVATE_REGISTRY=""
+
+# File listing upstream registries to mirror (one per line, comments allowed).
+# See mirror-registries.example for the format and defaults.
+# If unset, uses built-in defaults: docker.io, quay.io, ghcr.io,
+# registry.k8s.io, gcr.io, docker.elastic.co
+# MIRROR_REGISTRIES_FILE="/path/to/mirror-registries.conf"
 
 # =============================================================================
 # Private CA Certificate (for registry/Helm repo TLS)

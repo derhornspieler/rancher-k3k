@@ -10,6 +10,7 @@
 #   build_helm_repo_flags - Populate HELM_REPO_FLAGS array
 #   build_helm_ca_flags   - Populate HELM_CA_FLAGS array
 #   inject_helmchart_auth - Replace auth/CA placeholders in HelmChart CRs
+#   load_mirror_registries - Load registry list from file or built-in defaults
 #   build_registries_yaml - Generate K3s registries.yaml for Harbor proxy caches
 #   inject_secret_mounts  - Replace secretMounts/serverArgs placeholders in Cluster CR
 
@@ -154,15 +155,21 @@ inject_helmchart_auth() {
     fi
 }
 
-# Upstream registries that the Rancher-on-k3k stack pulls from.
-# Each needs a corresponding proxy cache project in Harbor.
-#   docker.io       - K3s system images, Rancher, Fleet
-#   quay.io         - cert-manager (jetstack)
-#   ghcr.io         - CloudNativePG, Zalando postgres-operator
-#   registry.k8s.io - Kubernetes system images (metrics-server, coredns, pause)
-#   gcr.io          - Google container images (legacy k8s images)
-#   docker.elastic.co - Elasticsearch, Kibana
-MIRROR_REGISTRIES=("docker.io" "quay.io" "ghcr.io" "registry.k8s.io" "gcr.io" "docker.elastic.co")
+# Load mirror registries from MIRROR_REGISTRIES_FILE.
+# Reads one registry per line (ignoring comments/blanks).
+# If no file is set, MIRROR_REGISTRIES stays empty — no rewrites, direct internet.
+# Sets: MIRROR_REGISTRIES array
+load_mirror_registries() {
+    MIRROR_REGISTRIES=()
+    if [[ -n "${MIRROR_REGISTRIES_FILE:-}" && -f "$MIRROR_REGISTRIES_FILE" ]]; then
+        while IFS= read -r line; do
+            line="${line%%#*}"       # strip comments
+            line="${line// /}"       # strip spaces
+            [[ -z "$line" ]] && continue
+            MIRROR_REGISTRIES+=("$line")
+        done < "$MIRROR_REGISTRIES_FILE"
+    fi
+}
 
 # Generate a K3s registries.yaml with mirror entries for all upstream registries.
 # Writes the YAML to the file path given as the first argument.
@@ -175,12 +182,19 @@ MIRROR_REGISTRIES=("docker.io" "quay.io" "ghcr.io" "registry.k8s.io" "gcr.io" "d
 #   quay.io/jetstack/cert-manager-controller:v1.18 → harbor.example.com/quay.io/jetstack/cert-manager-controller:v1.18
 #
 # Usage: build_registries_yaml <output-file>
-# Reads: PRIVATE_REGISTRY, PRIVATE_CA_PATH, HELM_REPO_USER, HELM_REPO_PASS
+# Reads: PRIVATE_REGISTRY, PRIVATE_CA_PATH, HELM_REPO_USER, HELM_REPO_PASS,
+#         MIRROR_REGISTRIES_FILE
 build_registries_yaml() {
     local outfile="$1"
     local reg_host="${PRIVATE_REGISTRY:-}"
 
     if [[ -z "$reg_host" ]]; then
+        return 1
+    fi
+
+    # Load registry list from file (empty = no rewrites)
+    load_mirror_registries
+    if [[ ${#MIRROR_REGISTRIES[@]} -eq 0 ]]; then
         return 1
     fi
 
@@ -224,47 +238,54 @@ REGEOF
 }
 
 # Replace secretMounts and extra serverArgs placeholders in a Cluster CR manifest.
-# If PRIVATE_REGISTRY is set, injects secretMounts for registries.yaml (and optionally CA).
 # If PRIVATE_REGISTRY is set, injects --system-default-registry serverArg.
+# If MIRROR_REGISTRIES_FILE is set, injects secretMounts for registries.yaml (and optionally CA).
 # Otherwise removes the placeholders.
 #
 # Requires k3k >= v1.0.2-rc2 (PR #570 added secretMounts to the CRD).
 #
 # Usage: inject_secret_mounts <manifest-file>
-# Reads: PRIVATE_REGISTRY, PRIVATE_CA_PATH
+# Reads: PRIVATE_REGISTRY, PRIVATE_CA_PATH, MIRROR_REGISTRIES_FILE
 inject_secret_mounts() {
     local file="$1"
 
     if [[ -n "${PRIVATE_REGISTRY:-}" ]]; then
-        # Build the secretMounts block in a temp file
+        # secretMounts only needed when mirror registries are configured
+        local _has_mounts=false
         local mounts_file
         mounts_file=$(mktemp)
-        {
-            echo "  secretMounts:"
-            echo "    - secretName: k3s-registry-config"
-            echo "      mountPath: /etc/rancher/k3s/registries.yaml"
-            echo "      subPath: registries.yaml"
-            echo "      role: all"
-            if [[ -n "${PRIVATE_CA_PATH:-}" ]]; then
-                echo "    - secretName: k3s-registry-ca"
-                echo "      mountPath: /etc/rancher/k3s/tls/ca.crt"
-                echo "      subPath: ca.crt"
+        if [[ -n "${MIRROR_REGISTRIES_FILE:-}" ]]; then
+            _has_mounts=true
+            {
+                echo "  secretMounts:"
+                echo "    - secretName: k3s-registry-config"
+                echo "      mountPath: /etc/rancher/k3s/registries.yaml"
+                echo "      subPath: registries.yaml"
                 echo "      role: all"
-            fi
-        } > "$mounts_file"
+                if [[ -n "${PRIVATE_CA_PATH:-}" ]]; then
+                    echo "    - secretName: k3s-registry-ca"
+                    echo "      mountPath: /etc/rancher/k3s/tls/ca.crt"
+                    echo "      subPath: ca.crt"
+                    echo "      role: all"
+                fi
+            } > "$mounts_file"
+        fi
 
-        # Replace __SECRET_MOUNTS__ with the contents of mounts_file
-        # Use line-by-line approach for macOS/Linux portability
-        local tmpfile
-        tmpfile=$(mktemp)
-        while IFS= read -r line; do
-            if [[ "$line" == *"__SECRET_MOUNTS__"* ]]; then
-                cat "$mounts_file"
-            else
-                printf '%s\n' "$line"
-            fi
-        done < "$file" > "$tmpfile"
-        mv "$tmpfile" "$file"
+        # Replace __SECRET_MOUNTS__ with mounts (or remove if none)
+        if $_has_mounts; then
+            local tmpfile
+            tmpfile=$(mktemp)
+            while IFS= read -r line; do
+                if [[ "$line" == *"__SECRET_MOUNTS__"* ]]; then
+                    cat "$mounts_file"
+                else
+                    printf '%s\n' "$line"
+                fi
+            done < "$file" > "$tmpfile"
+            mv "$tmpfile" "$file"
+        else
+            sedi "/__SECRET_MOUNTS__/d" "$file"
+        fi
         rm -f "$mounts_file"
 
         # Inject --system-default-registry serverArg (K3s system images are all on docker.io)

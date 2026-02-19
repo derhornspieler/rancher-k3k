@@ -164,6 +164,27 @@ if [[ -z "${PRIVATE_REGISTRY+x}" ]]; then
     fi
 fi
 
+# --- Mirror registries file (optional) ---
+echo ""
+echo -e "${CYAN}Mirror Registries (press Enter for defaults):${NC}"
+echo "  File with one upstream registry per line (e.g. docker.io, quay.io)."
+echo "  See mirror-registries.example for the format."
+echo "  Leave empty to use built-in defaults."
+if [[ -z "${MIRROR_REGISTRIES_FILE+x}" ]]; then
+    if [[ -n "$CONFIG_FILE" ]]; then
+        MIRROR_REGISTRIES_FILE=""
+    else
+        read -rp "Mirror registries file []: " MIRROR_REGISTRIES_FILE
+        MIRROR_REGISTRIES_FILE="${MIRROR_REGISTRIES_FILE:-}"
+    fi
+fi
+
+# Validate mirror registries file if provided
+if [[ -n "$MIRROR_REGISTRIES_FILE" && ! -f "$MIRROR_REGISTRIES_FILE" ]]; then
+    err "Mirror registries file not found: $MIRROR_REGISTRIES_FILE"
+    exit 1
+fi
+
 # --- Private CA certificate (optional) ---
 echo ""
 echo -e "${CYAN}Private CA Certificate (press Enter to skip):${NC}"
@@ -274,7 +295,8 @@ echo "  cert-manager:     $CERTMANAGER_REPO ($CERTMANAGER_VERSION)$(is_oci "$CER
 echo "  Rancher:          $RANCHER_REPO ($RANCHER_VERSION)$(is_oci "$RANCHER_REPO" && echo ' [OCI]')"
 echo "  k3k:              $K3K_REPO ($K3K_VERSION)$(is_oci "$K3K_REPO" && echo ' [OCI]')"
 echo "  TLS Source:       $TLS_SOURCE"
-[[ -n "$PRIVATE_REGISTRY" ]] && echo "  Registry:         $PRIVATE_REGISTRY (mirrors: docker.io, quay.io, ghcr.io)"
+[[ -n "$PRIVATE_REGISTRY" ]] && echo "  Registry:         $PRIVATE_REGISTRY"
+[[ -n "$MIRROR_REGISTRIES_FILE" ]] && echo "  Mirror Registries: $MIRROR_REGISTRIES_FILE" || { [[ -n "$PRIVATE_REGISTRY" ]] && echo "  Mirror Registries: (built-in defaults)"; }
 [[ -n "$PRIVATE_CA_PATH" ]] && echo "  CA Cert:          $PRIVATE_CA_PATH"
 [[ -n "$CA_CERT_PATH" ]] && echo "  CA Issuer:        $CA_CERT_PATH (cert-manager CA Issuer)"
 [[ -n "$HELM_REPO_USER" ]] && echo "  Helm Auth:        $HELM_REPO_USER / ****" || echo "  Helm Auth:        none (public repos)"
@@ -404,7 +426,7 @@ log "k3k controller is ready"
 # =============================================================================
 # Step 1.5 (optional): Create registry config Secrets for k3k cluster
 # =============================================================================
-if [[ -n "$PRIVATE_REGISTRY" ]]; then
+if [[ -n "$PRIVATE_REGISTRY" && -n "$MIRROR_REGISTRIES_FILE" ]]; then
     log "Creating K3s registry config for k3k cluster..."
 
     # Ensure namespace exists before creating Secrets
@@ -412,12 +434,15 @@ if [[ -n "$PRIVATE_REGISTRY" ]]; then
 
     # Generate and store registries.yaml
     REGISTRIES_FILE=$(mktemp)
-    build_registries_yaml "$REGISTRIES_FILE"
-    log "Generated registries.yaml:"
-    cat "$REGISTRIES_FILE" | while IFS= read -r line; do echo "    $line"; done
-    kubectl -n "$K3K_NS" create secret generic k3s-registry-config \
-        --from-file=registries.yaml="$REGISTRIES_FILE" \
-        --dry-run=client -o yaml | kubectl apply -f -
+    if build_registries_yaml "$REGISTRIES_FILE"; then
+        log "Generated registries.yaml:"
+        cat "$REGISTRIES_FILE" | while IFS= read -r line; do echo "    $line"; done
+        kubectl -n "$K3K_NS" create secret generic k3s-registry-config \
+            --from-file=registries.yaml="$REGISTRIES_FILE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+    else
+        warn "No mirror registries loaded from $MIRROR_REGISTRIES_FILE, skipping registries.yaml"
+    fi
     rm -f "$REGISTRIES_FILE"
 
     # Store CA cert if provided
@@ -428,6 +453,8 @@ if [[ -n "$PRIVATE_REGISTRY" ]]; then
     fi
 
     log "Registry config Secrets created in $K3K_NS"
+elif [[ -n "$PRIVATE_REGISTRY" ]]; then
+    log "Private registry set but no MIRROR_REGISTRIES_FILE — using direct internet (no rewrites)"
 fi
 
 # =============================================================================
