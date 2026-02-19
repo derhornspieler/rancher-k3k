@@ -146,7 +146,7 @@ prompt_or_default CERTMANAGER_VERSION "cert-manager version [v1.18.5]: " "v1.18.
 prompt_or_default RANCHER_REPO "Rancher source [https://releases.rancher.com/server-charts/latest]: " "https://releases.rancher.com/server-charts/latest"
 prompt_or_default RANCHER_VERSION "Rancher version [v2.13.2]: " "v2.13.2"
 prompt_or_default K3K_REPO "k3k source [https://rancher.github.io/k3k]: " "https://rancher.github.io/k3k"
-prompt_or_default K3K_VERSION "k3k version [1.0.2-rc2]: " "1.0.2-rc2"
+prompt_or_default K3K_VERSION "k3k version [1.0.2]: " "1.0.2"
 
 # --- Private registry (optional) ---
 echo ""
@@ -175,6 +175,28 @@ if [[ -z "${PRIVATE_CA_PATH+x}" ]]; then
     else
         read -rp "CA certificate path []: " PRIVATE_CA_PATH
         PRIVATE_CA_PATH="${PRIVATE_CA_PATH:-}"
+    fi
+fi
+
+# --- CA certificate for Rancher TLS (optional) ---
+echo ""
+echo -e "${CYAN}CA Certificate for Rancher TLS (press Enter to skip):${NC}"
+echo "  Provide root CA cert + key to sign Rancher's TLS certificate via cert-manager."
+echo "  This creates a cert-manager CA Issuer and auto-renewing Certificate."
+if [[ -z "${CA_CERT_PATH+x}" ]]; then
+    if [[ -n "$CONFIG_FILE" ]]; then
+        CA_CERT_PATH=""
+    else
+        read -rp "CA certificate path []: " CA_CERT_PATH
+        CA_CERT_PATH="${CA_CERT_PATH:-}"
+    fi
+fi
+if [[ -z "${CA_KEY_PATH+x}" ]]; then
+    if [[ -n "$CONFIG_FILE" ]]; then
+        CA_KEY_PATH=""
+    else
+        read -rp "CA private key path []: " CA_KEY_PATH
+        CA_KEY_PATH="${CA_KEY_PATH:-}"
     fi
 fi
 
@@ -216,6 +238,26 @@ if [[ -n "$PRIVATE_CA_PATH" && ! -f "$PRIVATE_CA_PATH" ]]; then
     exit 1
 fi
 
+# Validate CA cert/key pair for cert-manager CA Issuer
+if [[ -n "$CA_CERT_PATH" || -n "$CA_KEY_PATH" ]]; then
+    if [[ -z "$CA_CERT_PATH" || -z "$CA_KEY_PATH" ]]; then
+        err "Both CA_CERT_PATH and CA_KEY_PATH must be set together"
+        exit 1
+    fi
+    if [[ ! -f "$CA_CERT_PATH" ]]; then
+        err "CA certificate file not found: $CA_CERT_PATH"
+        exit 1
+    fi
+    if [[ ! -f "$CA_KEY_PATH" ]]; then
+        err "CA private key file not found: $CA_KEY_PATH"
+        exit 1
+    fi
+    if [[ "$TLS_SOURCE" != "secret" ]]; then
+        log "CA cert+key provided, overriding TLS_SOURCE to 'secret' (cert-manager CA Issuer)"
+        TLS_SOURCE="secret"
+    fi
+fi
+
 # --- Confirm ---
 echo ""
 echo -e "${CYAN}Configuration Summary:${NC}"
@@ -234,6 +276,7 @@ echo "  k3k:              $K3K_REPO ($K3K_VERSION)$(is_oci "$K3K_REPO" && echo '
 echo "  TLS Source:       $TLS_SOURCE"
 [[ -n "$PRIVATE_REGISTRY" ]] && echo "  Registry:         $PRIVATE_REGISTRY (mirrors: docker.io, quay.io, ghcr.io)"
 [[ -n "$PRIVATE_CA_PATH" ]] && echo "  CA Cert:          $PRIVATE_CA_PATH"
+[[ -n "$CA_CERT_PATH" ]] && echo "  CA Issuer:        $CA_CERT_PATH (cert-manager CA Issuer)"
 [[ -n "$HELM_REPO_USER" ]] && echo "  Helm Auth:        $HELM_REPO_USER / ****" || echo "  Helm Auth:        none (public repos)"
 echo ""
 prompt_or_default CONFIRM "Proceed? (yes/no) [yes]: " "yes"
@@ -300,6 +343,12 @@ if [[ -n "$PRIVATE_CA_PATH" && "$TLS_SOURCE" != "rancher" ]]; then
     # With TLS_SOURCE=rancher, Rancher manages its own self-signed CA automatically;
     # setting privateCA=true would override that with the Harbor root CA, breaking
     # the trust chain for downstream cluster agents.
+    EXTRA_RANCHER_VALUES="${EXTRA_RANCHER_VALUES}    privateCA: \"true\"\n"
+fi
+
+if [[ -n "$CA_CERT_PATH" && -z "$PRIVATE_CA_PATH" ]]; then
+    # CA Issuer mode also needs privateCA so Rancher reads tls-ca for /cacerts.
+    # Skip if PRIVATE_CA_PATH already set (the block above handles it).
     EXTRA_RANCHER_VALUES="${EXTRA_RANCHER_VALUES}    privateCA: \"true\"\n"
 fi
 
@@ -457,8 +506,9 @@ log "Connected to k3k virtual cluster"
 # =============================================================================
 # Step 3.5 (optional): Install private CA into k3k cluster
 # =============================================================================
-if [[ -n "$PRIVATE_CA_PATH" && "$TLS_SOURCE" != "rancher" ]]; then
-    # Create tls-ca secret only when Rancher needs a user-provided CA (TLS_SOURCE=secret).
+if [[ -n "$PRIVATE_CA_PATH" && "$TLS_SOURCE" != "rancher" && -z "$CA_CERT_PATH" ]]; then
+    # Create tls-ca secret only when Rancher needs a user-provided CA (TLS_SOURCE=secret)
+    # and CA_CERT_PATH is NOT set (step 4.5 handles tls-ca in CA Issuer mode).
     # With TLS_SOURCE=rancher, Rancher auto-generates its own CA; injecting only the
     # Harbor root CA here would replace Rancher's CA in the cacerts setting.
     log "Installing private CA certificate into k3k cluster..."
@@ -558,6 +608,61 @@ done
 $K3K_CMD wait --for=condition=available deploy/cert-manager -n cert-manager --timeout=300s
 $K3K_CMD wait --for=condition=available deploy/cert-manager-webhook -n cert-manager --timeout=300s
 log "cert-manager is ready"
+
+# =============================================================================
+# Step 4.5 (optional): Create CA Issuer + Certificate for Rancher TLS
+# =============================================================================
+if [[ -n "$CA_CERT_PATH" ]]; then
+    log "Step 4.5: Creating cert-manager CA Issuer for Rancher TLS..."
+
+    # Ensure cattle-system namespace exists
+    $K3K_CMD create namespace cattle-system --dry-run=client -o yaml | $K3K_CMD apply -f -
+
+    # Create the CA signing keypair secret
+    $K3K_CMD -n cattle-system create secret tls ca-signing-keypair \
+        --cert="$CA_CERT_PATH" --key="$CA_KEY_PATH" \
+        --dry-run=client -o yaml | $K3K_CMD apply -f -
+
+    # Create the CA Issuer
+    $K3K_CMD apply -f - <<'ISSUER_EOF'
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ca-issuer
+  namespace: cattle-system
+spec:
+  ca:
+    secretName: ca-signing-keypair
+ISSUER_EOF
+
+    # Create the Certificate CR for Rancher
+    $K3K_CMD apply -f - <<CERT_EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tls-rancher-ingress
+  namespace: cattle-system
+spec:
+  secretName: tls-rancher-ingress
+  issuerRef:
+    name: ca-issuer
+    kind: Issuer
+  dnsNames:
+    - "${HOSTNAME}"
+  duration: 2160h
+  renewBefore: 360h
+CERT_EOF
+
+    # Create tls-ca secret (Rancher reads this for /cacerts endpoint)
+    $K3K_CMD -n cattle-system create secret generic tls-ca \
+        --from-file=cacerts.pem="$CA_CERT_PATH" \
+        --dry-run=client -o yaml | $K3K_CMD apply -f -
+
+    # Wait for the certificate to be issued
+    log "Waiting for CA-signed certificate to be issued..."
+    $K3K_CMD wait --for=condition=Ready certificate/tls-rancher-ingress -n cattle-system --timeout=120s
+    log "CA-signed certificate issued for $HOSTNAME"
+fi
 
 # =============================================================================
 # Step 5: Deploy Rancher
