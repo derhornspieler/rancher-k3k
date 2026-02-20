@@ -6,7 +6,7 @@
 # Usage: set MIRROR_REGISTRIES_FILE in deploy.conf to point to your copy:
 #   MIRROR_REGISTRIES_FILE="/path/to/mirror-registries.conf"
 #
-# If MIRROR_REGISTRIES_FILE is not set, deploy.sh uses these built-in defaults.
+# If MIRROR_REGISTRIES_FILE is not set, no rewrites are applied (direct internet).
 
 # K3s system images, Rancher, Fleet
 docker.io

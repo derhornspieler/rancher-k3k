@@ -94,9 +94,8 @@ CA_KEY_PATH=""
 PRIVATE_REGISTRY=""
 
 # File listing upstream registries to mirror (one per line, comments allowed).
-# See mirror-registries.example for the format and defaults.
-# If unset, uses built-in defaults: docker.io, quay.io, ghcr.io,
-# registry.k8s.io, gcr.io, docker.elastic.co
+# See mirror-registries.example for the format.
+# If unset, no mirror rewrites — K3s pulls directly from the internet.
 # MIRROR_REGISTRIES_FILE="/path/to/mirror-registries.conf"
 
 # =============================================================================

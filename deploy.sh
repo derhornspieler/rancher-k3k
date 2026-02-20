@@ -152,9 +152,8 @@ prompt_or_default K3K_VERSION "k3k version [1.0.2]: " "1.0.2"
 echo ""
 echo -e "${CYAN}Private Container Registry (press Enter to skip):${NC}"
 echo "  Enter the registry host (e.g. harbor.example.com)."
-echo "  Containerd mirrors are generated for: docker.io, quay.io, ghcr.io"
-echo "  Each requires a matching proxy cache project in Harbor."
-echo "  Requires k3k >= v1.0.2-rc2 (secretMounts support)."
+echo "  Sets systemDefaultRegistry for Rancher images."
+echo "  For mirror rewrites, also set MIRROR_REGISTRIES_FILE."
 if [[ -z "${PRIVATE_REGISTRY+x}" ]]; then
     if [[ -n "$CONFIG_FILE" ]]; then
         PRIVATE_REGISTRY=""
@@ -166,10 +165,10 @@ fi
 
 # --- Mirror registries file (optional) ---
 echo ""
-echo -e "${CYAN}Mirror Registries (press Enter for defaults):${NC}"
+echo -e "${CYAN}Mirror Registries (press Enter to skip):${NC}"
 echo "  File with one upstream registry per line (e.g. docker.io, quay.io)."
 echo "  See mirror-registries.example for the format."
-echo "  Leave empty to use built-in defaults."
+echo "  Leave empty for no rewrites (direct internet)."
 if [[ -z "${MIRROR_REGISTRIES_FILE+x}" ]]; then
     if [[ -n "$CONFIG_FILE" ]]; then
         MIRROR_REGISTRIES_FILE=""
@@ -296,7 +295,7 @@ echo "  Rancher:          $RANCHER_REPO ($RANCHER_VERSION)$(is_oci "$RANCHER_REP
 echo "  k3k:              $K3K_REPO ($K3K_VERSION)$(is_oci "$K3K_REPO" && echo ' [OCI]')"
 echo "  TLS Source:       $TLS_SOURCE"
 [[ -n "$PRIVATE_REGISTRY" ]] && echo "  Registry:         $PRIVATE_REGISTRY"
-[[ -n "$MIRROR_REGISTRIES_FILE" ]] && echo "  Mirror Registries: $MIRROR_REGISTRIES_FILE" || { [[ -n "$PRIVATE_REGISTRY" ]] && echo "  Mirror Registries: (built-in defaults)"; }
+[[ -n "$MIRROR_REGISTRIES_FILE" ]] && echo "  Mirror Registries: $MIRROR_REGISTRIES_FILE" || { [[ -n "$PRIVATE_REGISTRY" ]] && echo "  Mirror Registries: none (direct internet)"; }
 [[ -n "$PRIVATE_CA_PATH" ]] && echo "  CA Cert:          $PRIVATE_CA_PATH"
 [[ -n "$CA_CERT_PATH" ]] && echo "  CA Issuer:        $CA_CERT_PATH (cert-manager CA Issuer)"
 [[ -n "$HELM_REPO_USER" ]] && echo "  Helm Auth:        $HELM_REPO_USER / ****" || echo "  Helm Auth:        none (public repos)"
