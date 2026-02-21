@@ -70,20 +70,26 @@ SERVER_COUNT=1
 TLS_SOURCE="rancher"
 
 # =============================================================================
-# CA Issuer — cert-manager signs Rancher's TLS cert with your root CA
+# CA Issuer — cert-manager signs Rancher's TLS cert with a signing CA
 # =============================================================================
 
-# Path to root CA certificate PEM file (must be a CA cert, not a leaf cert)
+# Path to signing CA (intermediate) certificate PEM file.
+# Generate with the PKI repo: ./generate-ca.sh intermediate -n k3k-signing ...
 CA_CERT_PATH=""
 
-# Path to root CA private key PEM file
+# Path to signing CA (intermediate) private key PEM file
 CA_KEY_PATH=""
 
-# When both CA_CERT_PATH and CA_KEY_PATH are set:
+# Path to full CA chain file (intermediate + root concatenated).
+# Rancher serves this at /cacerts so downstream agents trust the full chain.
+# If unset, falls back to CA_CERT_PATH with a warning (single-CA mode).
+CA_CHAIN_PATH=""
+
+# When CA_CERT_PATH and CA_KEY_PATH are set:
 #   - TLS_SOURCE is automatically overridden to "secret"
 #   - cert-manager creates a CA Issuer and issues a leaf cert for HOSTNAME
 #   - The leaf cert auto-renews every ~75 days (90d duration, 15d renewBefore)
-#   - Rancher serves the CA cert at /cacerts for downstream agent trust
+#   - Rancher serves CA_CHAIN_PATH at /cacerts for downstream agent trust
 
 # =============================================================================
 # Private Container Registry

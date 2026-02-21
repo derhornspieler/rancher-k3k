@@ -201,8 +201,10 @@ fi
 # --- CA certificate for Rancher TLS (optional) ---
 echo ""
 echo -e "${CYAN}CA Certificate for Rancher TLS (press Enter to skip):${NC}"
-echo "  Provide root CA cert + key to sign Rancher's TLS certificate via cert-manager."
+echo "  Provide a signing CA (intermediate) cert + key for cert-manager CA Issuer."
 echo "  This creates a cert-manager CA Issuer and auto-renewing Certificate."
+echo "  Optionally set CA_CHAIN_PATH to a full chain file (intermediate + root)"
+echo "  for Rancher's /cacerts endpoint."
 if [[ -z "${CA_CERT_PATH+x}" ]]; then
     if [[ -n "$CONFIG_FILE" ]]; then
         CA_CERT_PATH=""
@@ -217,6 +219,14 @@ if [[ -z "${CA_KEY_PATH+x}" ]]; then
     else
         read -rp "CA private key path []: " CA_KEY_PATH
         CA_KEY_PATH="${CA_KEY_PATH:-}"
+    fi
+fi
+if [[ -z "${CA_CHAIN_PATH+x}" ]]; then
+    if [[ -n "$CONFIG_FILE" ]]; then
+        CA_CHAIN_PATH=""
+    else
+        read -rp "CA chain file path (intermediate + root) []: " CA_CHAIN_PATH
+        CA_CHAIN_PATH="${CA_CHAIN_PATH:-}"
     fi
 fi
 
@@ -276,6 +286,15 @@ if [[ -n "$CA_CERT_PATH" || -n "$CA_KEY_PATH" ]]; then
         log "CA cert+key provided, overriding TLS_SOURCE to 'secret' (cert-manager CA Issuer)"
         TLS_SOURCE="secret"
     fi
+    # Fallback: if no chain file provided, use the cert itself (single CA, no hierarchy)
+    if [[ -z "${CA_CHAIN_PATH:-}" ]]; then
+        warn "CA_CHAIN_PATH not set — falling back to CA_CERT_PATH for /cacerts."
+        warn "Set CA_CHAIN_PATH to a full chain file (intermediate + root) for proper trust."
+        CA_CHAIN_PATH="$CA_CERT_PATH"
+    elif [[ ! -f "$CA_CHAIN_PATH" ]]; then
+        err "CA chain file not found: $CA_CHAIN_PATH"
+        exit 1
+    fi
 fi
 
 # --- Confirm ---
@@ -298,6 +317,7 @@ echo "  TLS Source:       $TLS_SOURCE"
 [[ -n "$MIRROR_REGISTRIES_FILE" ]] && echo "  Mirror Registries: $MIRROR_REGISTRIES_FILE" || { [[ -n "$PRIVATE_REGISTRY" ]] && echo "  Mirror Registries: none (direct internet)"; }
 [[ -n "$PRIVATE_CA_PATH" ]] && echo "  CA Cert:          $PRIVATE_CA_PATH"
 [[ -n "$CA_CERT_PATH" ]] && echo "  CA Issuer:        $CA_CERT_PATH (cert-manager CA Issuer)"
+[[ -n "${CA_CHAIN_PATH:-}" ]] && echo "  CA Chain:         $CA_CHAIN_PATH"
 [[ -n "$HELM_REPO_USER" ]] && echo "  Helm Auth:        $HELM_REPO_USER / ****" || echo "  Helm Auth:        none (public repos)"
 echo ""
 prompt_or_default CONFIRM "Proceed? (yes/no) [yes]: " "yes"
@@ -680,8 +700,10 @@ spec:
 CERT_EOF
 
     # Create tls-ca secret (Rancher reads this for /cacerts endpoint)
+    # Uses CA_CHAIN_PATH (full chain: intermediate + root) so downstream agents
+    # can verify the complete trust chain.
     $K3K_CMD -n cattle-system create secret generic tls-ca \
-        --from-file=cacerts.pem="$CA_CERT_PATH" \
+        --from-file=cacerts.pem="$CA_CHAIN_PATH" \
         --dry-run=client -o yaml | $K3K_CMD apply -f -
 
     # Wait for the certificate to be issued
