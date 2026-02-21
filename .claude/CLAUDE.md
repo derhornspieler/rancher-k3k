@@ -18,10 +18,10 @@ Aegis Group Root CA (30yr, offline)
 |----------|-----------|----------|
 | `CA_CERT_PATH` | Intermediate (signing) CA cert | cert-manager CA Issuer `ca-signing-keypair` secret |
 | `CA_KEY_PATH` | Intermediate CA private key | cert-manager CA Issuer `ca-signing-keypair` secret |
-| `CA_CHAIN_PATH` | Full chain (intermediate + root) | Rancher `tls-ca` secret → `/cacerts` endpoint |
+| `CA_ROOT_PATH` | Root CA cert (trust anchor) | Rancher `tls-ca` secret → `/cacerts` endpoint |
 | `PRIVATE_CA_PATH` | Harbor/registry CA bundle | K3s registry TLS trust, Helm repo TLS |
 
-`CA_CHAIN_PATH` falls back to `CA_CERT_PATH` if unset (backward compat, warns).
+`CA_ROOT_PATH` falls back to `CA_CERT_PATH` if unset (backward compat, warns).
 
 ## Shell Conventions
 - `set -euo pipefail` in all scripts

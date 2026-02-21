@@ -80,16 +80,16 @@ CA_CERT_PATH=""
 # Path to signing CA (intermediate) private key PEM file
 CA_KEY_PATH=""
 
-# Path to full CA chain file (intermediate + root concatenated).
-# Rancher serves this at /cacerts so downstream agents trust the full chain.
+# Path to root CA certificate PEM file (trust anchor).
+# Rancher serves this at /cacerts so downstream agents trust the hierarchy.
 # If unset, falls back to CA_CERT_PATH with a warning (single-CA mode).
-CA_CHAIN_PATH=""
+CA_ROOT_PATH=""
 
 # When CA_CERT_PATH and CA_KEY_PATH are set:
 #   - TLS_SOURCE is automatically overridden to "secret"
 #   - cert-manager creates a CA Issuer and issues a leaf cert for HOSTNAME
 #   - The leaf cert auto-renews every ~75 days (90d duration, 15d renewBefore)
-#   - Rancher serves CA_CHAIN_PATH at /cacerts for downstream agent trust
+#   - Rancher serves CA_ROOT_PATH at /cacerts for downstream agent trust
 
 # =============================================================================
 # Private Container Registry
