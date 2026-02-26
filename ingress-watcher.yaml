@@ -3,11 +3,15 @@
 # within seconds of a pod restart, instead of waiting for the CronJob's
 # 5-minute cycle. Supports both single-node and HA (3-node) clusters.
 #
-# Handles two scenarios:
+# Handles three scenarios:
 #   1. Any pod becomes Ready after reschedule — waits for k3k controller to
 #      finish reconciling (which deletes the host Ingress), then recreates it.
 #   2. Any pod enters CrashLoopBackOff with flannel error — patches the Cluster
 #      CR with --disable-network-policy and resets that specific pod.
+#   3. Etcd quorum deadlock (HA only) — all pods CrashLoopBackOff with
+#      "timed out waiting for node to change IP". Auto-recovers by temporarily
+#      scaling to 1 server (triggers k3k's built-in cluster-reset), then back
+#      to original count. State tracked via Cluster CR annotations.
 #
 # The CronJob (ingress-reconciler) is kept as a safety net.
 #
@@ -53,6 +57,7 @@ spec:
               STATE_DIR="/tmp/watcher-state"
 
               mkdir -p "$STATE_DIR"
+              RECOVERY_TIMEOUT=600  # 10 minutes per state
               log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
               # Per-pod state helpers (file-based to support dynamic pod count)
@@ -145,10 +150,156 @@ spec:
                   log "=== Flannel crash recovery complete ==="
               }
 
+              # --- Etcd quorum deadlock detection ---
+              check_etcd_deadlock() {
+                  local server_count
+                  server_count=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                      -o jsonpath='{.spec.servers}' 2>/dev/null || echo "1")
+                  [ "$server_count" -le 1 ] && return 1
+
+                  local total=0 crash=0 etcd_timeout=false
+                  for P in $(kubectl get pods -l "cluster=$CLUSTER,role=server" -n "$NS" \
+                      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                      total=$((total + 1))
+                      local wait_reason
+                      wait_reason=$(kubectl get pod "$P" -n "$NS" \
+                          -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' \
+                          2>/dev/null || echo "")
+                      if [ "$wait_reason" = "CrashLoopBackOff" ]; then
+                          crash=$((crash + 1))
+                          if kubectl logs "$P" -n "$NS" --previous --tail=20 2>/dev/null \
+                              | grep -q "timed out waiting for node to change IP"; then
+                              etcd_timeout=true
+                          fi
+                      fi
+                  done
+
+                  [ "$total" -gt 1 ] && [ "$crash" -eq "$total" ] && [ "$etcd_timeout" = "true" ]
+              }
+
+              # --- Etcd quorum recovery state machine ---
+              recover_etcd_quorum() {
+                  local recovery_state recovery_started
+                  recovery_state=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                      -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-recovery-state}' \
+                      2>/dev/null || echo "")
+                  recovery_started=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                      -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-recovery-started}' \
+                      2>/dev/null || echo "")
+
+                  # Check timeout for current state
+                  if [ -n "$recovery_started" ]; then
+                      local started_epoch now_epoch elapsed
+                      started_epoch=$(date -d "$recovery_started" +%s 2>/dev/null || echo "0")
+                      now_epoch=$(date +%s)
+                      elapsed=$((now_epoch - started_epoch))
+                      if [ "$elapsed" -gt "$RECOVERY_TIMEOUT" ]; then
+                          log "ERROR: Etcd recovery state '$recovery_state' timed out after ${elapsed}s"
+                          kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" --overwrite \
+                              "k3k.aegisgroup.ch/etcd-recovery-state=failed"
+                          return 1
+                      fi
+                  fi
+
+                  case "$recovery_state" in
+                      "")
+                          # Initial trigger — start recovery
+                          log "ETCD DEADLOCK DETECTED — Starting quorum recovery"
+                          local original_servers now_ts
+                          original_servers=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                              -o jsonpath='{.spec.servers}' 2>/dev/null || echo "3")
+                          now_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                          kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" --overwrite \
+                              "k3k.aegisgroup.ch/etcd-recovery-state=scaling-down" \
+                              "k3k.aegisgroup.ch/etcd-original-servers=$original_servers" \
+                              "k3k.aegisgroup.ch/etcd-recovery-started=$now_ts"
+                          log "Patching spec.servers to 1 (was $original_servers)"
+                          kubectl patch clusters.k3k.io "$CLUSTER" -n "$NS" --type=merge \
+                              -p '{"spec":{"servers":1}}'
+                          ;;
+                      scaling-down)
+                          local pod_count server0_ready
+                          pod_count=$(kubectl get pods -l "cluster=$CLUSTER,role=server" -n "$NS" \
+                              --no-headers 2>/dev/null | wc -l)
+                          server0_ready=$(kubectl get pod "${CLUSTER}-server-0" -n "$NS" \
+                              -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+                          log "scaling-down: ${pod_count} pod(s), server-0 ready=${server0_ready}"
+                          if [ "$pod_count" -le 1 ] && [ "$server0_ready" = "true" ]; then
+                              log "Single server-0 pod is Running — transitioning to resetting"
+                              kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" --overwrite \
+                                  "k3k.aegisgroup.ch/etcd-recovery-state=resetting" \
+                                  "k3k.aegisgroup.ch/etcd-recovery-started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                          fi
+                          ;;
+                      resetting)
+                          local phase
+                          phase=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                              -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                          log "resetting: cluster phase=${phase}"
+                          if [ "$phase" = "Ready" ]; then
+                              local original_servers
+                              original_servers=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                                  -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-original-servers}' \
+                                  2>/dev/null || echo "3")
+                              log "Cluster Ready after reset — scaling back to $original_servers servers"
+                              kubectl patch clusters.k3k.io "$CLUSTER" -n "$NS" --type=merge \
+                                  -p "{\"spec\":{\"servers\":${original_servers}}}"
+                              kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" --overwrite \
+                                  "k3k.aegisgroup.ch/etcd-recovery-state=scaling-up" \
+                                  "k3k.aegisgroup.ch/etcd-recovery-started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                          fi
+                          ;;
+                      scaling-up)
+                          local original_servers ready_count=0 phase
+                          original_servers=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                              -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-original-servers}' \
+                              2>/dev/null || echo "3")
+                          for P in $(kubectl get pods -l "cluster=$CLUSTER,role=server" -n "$NS" \
+                              -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                              local pod_ready
+                              pod_ready=$(kubectl get pod "$P" -n "$NS" \
+                                  -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+                              [ "$pod_ready" = "true" ] && ready_count=$((ready_count + 1))
+                          done
+                          phase=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                              -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                          log "scaling-up: ${ready_count}/${original_servers} pods ready, phase=${phase}"
+                          if [ "$ready_count" -ge "$original_servers" ] && [ "$phase" = "Ready" ]; then
+                              log "SUCCESS: All $original_servers servers ready — etcd quorum recovered"
+                              kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" \
+                                  "k3k.aegisgroup.ch/etcd-recovery-state-" \
+                                  "k3k.aegisgroup.ch/etcd-original-servers-" \
+                                  "k3k.aegisgroup.ch/etcd-recovery-started-"
+                              reconcile_ingress
+                          fi
+                          ;;
+                      failed)
+                          log "Etcd recovery in FAILED state — manual intervention required"
+                          ;;
+                  esac
+              }
+
               # --- Main watch loop ---
               log "Starting k3k pod watcher (poll every ${POLL_INTERVAL}s)"
 
               while true; do
+                  # --- Etcd recovery check (runs before per-pod processing) ---
+                  RECOVERY_STATE=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                      -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-recovery-state}' \
+                      2>/dev/null || echo "")
+
+                  if [ -n "$RECOVERY_STATE" ] && [ "$RECOVERY_STATE" != "failed" ]; then
+                      recover_etcd_quorum
+                      sleep "$POLL_INTERVAL"
+                      continue
+                  fi
+
+                  if check_etcd_deadlock; then
+                      recover_etcd_quorum
+                      sleep "$POLL_INTERVAL"
+                      continue
+                  fi
+
                   # Discover all server pods via label selector
                   PODS=$(kubectl get pods -l "cluster=$CLUSTER,role=server" -n "$NS" \
                       -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")

@@ -13,6 +13,11 @@
 #    flannel error, and deletes the pod to reset the backoff timer for faster
 #    recovery. It also ensures --disable-network-policy is set in serverArgs.
 #
+# 3. Etcd quorum deadlock (safety net) — When ALL HA server pods are in
+#    CrashLoopBackOff with "timed out waiting for node to change IP", sets
+#    recovery annotations and patches spec.servers=1 to trigger auto
+#    cluster-reset. The watcher Deployment owns the full recovery lifecycle.
+#
 # Usage:
 #   # Replace __HOSTNAME__ with your Rancher FQDN, then apply:
 #   sed 's|__HOSTNAME__|rancher.example.com|g' ingress-reconciler.yaml | kubectl apply -f -
@@ -165,5 +170,46 @@ spec:
                       echo "$POD is healthy (status: ${POD_STATUS:-Running})"
                     fi
                   done
+
+                  echo "=== Etcd deadlock check ==="
+
+                  # Count total server pods and CrashLoopBackOff pods
+                  TOTAL=0; CRASH=0; ETCD_TIMEOUT=false
+                  for POD in $(kubectl get pods -l "cluster=rancher,role=server" -n rancher-k3k -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                    TOTAL=$((TOTAL + 1))
+                    WAIT_REASON=$(kubectl get pod "$POD" -n rancher-k3k \
+                      -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+                    if [ "$WAIT_REASON" = "CrashLoopBackOff" ]; then
+                      CRASH=$((CRASH + 1))
+                      if kubectl logs "$POD" -n rancher-k3k --previous --tail=20 2>/dev/null \
+                          | grep -q "timed out waiting for node to change IP"; then
+                        ETCD_TIMEOUT=true
+                      fi
+                    fi
+                  done
+
+                  if [ "$TOTAL" -gt 1 ] && [ "$CRASH" -eq "$TOTAL" ] && [ "$ETCD_TIMEOUT" = "true" ]; then
+                    # Check if recovery is already in progress
+                    RECOVERY_STATE=$(kubectl get clusters.k3k.io rancher -n rancher-k3k \
+                      -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-recovery-state}' \
+                      2>/dev/null || echo "")
+                    if [ -z "$RECOVERY_STATE" ]; then
+                      echo "ETCD DEADLOCK DETECTED — triggering recovery"
+                      ORIGINAL_SERVERS=$(kubectl get clusters.k3k.io rancher -n rancher-k3k \
+                        -o jsonpath='{.spec.servers}' 2>/dev/null || echo "3")
+                      NOW_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                      kubectl annotate clusters.k3k.io rancher -n rancher-k3k --overwrite \
+                        "k3k.aegisgroup.ch/etcd-recovery-state=scaling-down" \
+                        "k3k.aegisgroup.ch/etcd-original-servers=$ORIGINAL_SERVERS" \
+                        "k3k.aegisgroup.ch/etcd-recovery-started=$NOW_TS"
+                      kubectl patch clusters.k3k.io rancher -n rancher-k3k --type=merge \
+                        -p '{"spec":{"servers":1}}'
+                      echo "Recovery triggered — watcher will drive the state machine"
+                    else
+                      echo "Etcd recovery already in progress (state=$RECOVERY_STATE)"
+                    fi
+                  else
+                    echo "No etcd deadlock (total=$TOTAL, crash=$CRASH, timeout=$ETCD_TIMEOUT)"
+                  fi
 
                   echo "=== Reconciliation complete ==="
