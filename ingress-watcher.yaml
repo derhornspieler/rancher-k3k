@@ -3,7 +3,7 @@
 # within seconds of a pod restart, instead of waiting for the CronJob's
 # 5-minute cycle. Supports both single-node and HA (3-node) clusters.
 #
-# Handles three scenarios:
+# Handles four scenarios:
 #   1. Any pod becomes Ready after reschedule — waits for k3k controller to
 #      finish reconciling (which deletes the host Ingress), then recreates it.
 #   2. Any pod enters CrashLoopBackOff with flannel error — patches the Cluster
@@ -12,6 +12,11 @@
 #      "timed out waiting for node to change IP". Auto-recovers by temporarily
 #      scaling to 1 server (triggers k3k's built-in cluster-reset), then back
 #      to original count. State tracked via Cluster CR annotations.
+#   4. HA server pod imbalance — after node drain/uncordon, multiple server pods
+#      may land on the same node, breaking HA protection. Detects imbalance and
+#      deletes the highest-ordinal pod on the most-loaded node so the scheduler
+#      redistributes it. Protects server-0, respects cordoned nodes, and uses
+#      debounce/cooldown to prevent delete loops.
 #
 # The CronJob (ingress-reconciler) is kept as a safety net.
 #
@@ -57,7 +62,10 @@ spec:
               STATE_DIR="/tmp/watcher-state"
 
               mkdir -p "$STATE_DIR"
-              RECOVERY_TIMEOUT=600  # 10 minutes per state
+              RECOVERY_TIMEOUT=600   # 10 minutes per state
+              REBALANCE_SETTLE=60    # seconds after pod Ready before rebalancing
+              REBALANCE_DEBOUNCE=300 # seconds between rebalance attempts
+              REBALANCE_COOLDOWN=1800 # seconds cooldown after failed move
               log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
               # Per-pod state helpers (file-based to support dynamic pod count)
@@ -279,6 +287,160 @@ spec:
                   esac
               }
 
+              # --- HA server pod auto-rebalancing ---
+              check_pod_balance() {
+                  local server_count
+                  server_count=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                      -o jsonpath='{.spec.servers}' 2>/dev/null || echo "1")
+                  [ "$server_count" -le 1 ] && return 0
+
+                  # Skip if etcd recovery is in progress
+                  local recovery_state
+                  recovery_state=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
+                      -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-recovery-state}' \
+                      2>/dev/null || echo "")
+                  if [ -n "$recovery_state" ] && [ "$recovery_state" != "failed" ]; then
+                      return 0
+                  fi
+
+                  # Build node→pod map via jsonpath (no jq dependency)
+                  local node_map_file="$STATE_DIR/cluster.node_map"
+                  : > "$node_map_file"
+                  local pod_names total_pods=0
+                  pod_names=$(kubectl get pods -l "cluster=$CLUSTER,role=server" -n "$NS" \
+                      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+                  [ -z "$pod_names" ] && return 0
+
+                  for P in $pod_names; do
+                      local node
+                      node=$(kubectl get pod "$P" -n "$NS" \
+                          -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+                      [ -z "$node" ] && continue
+                      echo "${P}:${node}" >> "$node_map_file"
+                      total_pods=$((total_pods + 1))
+                  done
+
+                  [ "$total_pods" -le 1 ] && return 0
+
+                  # Find the node with the most pods
+                  local max_line max_count max_node
+                  max_line=$(awk -F: '{print $2}' "$node_map_file" | sort | uniq -c | sort -rn | head -1)
+                  max_count=$(echo "$max_line" | awk '{print $1}')
+                  max_node=$(echo "$max_line" | awk '{print $2}')
+
+                  if [ "$max_count" -le 1 ]; then
+                      # Balanced — log success if a pending rebalance just completed
+                      local pending_pod
+                      pending_pod=$(get_state "cluster" "rebalance_pending_pod")
+                      if [ -n "$pending_pod" ]; then
+                          local current_node pending_node
+                          current_node=$(kubectl get pod "$pending_pod" -n "$NS" \
+                              -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+                          pending_node=$(get_state "cluster" "rebalance_pending_node")
+                          if [ -n "$current_node" ] && [ "$current_node" != "$pending_node" ]; then
+                              log "Rebalance SUCCESS: $pending_pod moved from $pending_node to $current_node"
+                          fi
+                          set_state "cluster" "rebalance_pending_pod" ""
+                          set_state "cluster" "rebalance_pending_node" ""
+                      fi
+                      rm -f "$STATE_DIR/cluster.rebalance_cooldown"
+                      return 0
+                  fi
+
+                  log "Pod imbalance detected: $max_count pods on node $max_node"
+
+                  # Count schedulable nodes (not cordoned)
+                  local schedulable_nodes=0
+                  for NODE_SCHED in $(kubectl get nodes \
+                      -o jsonpath='{range .items[*]}{.metadata.name}={.spec.unschedulable}{"\n"}{end}' \
+                      2>/dev/null); do
+                      local unsched
+                      unsched=$(echo "$NODE_SCHED" | cut -d= -f2)
+                      [ "$unsched" != "true" ] && schedulable_nodes=$((schedulable_nodes + 1))
+                  done
+
+                  if [ "$schedulable_nodes" -lt "$server_count" ]; then
+                      log "WARN: Only $schedulable_nodes schedulable nodes for $server_count servers — skipping rebalance"
+                      return 0
+                  fi
+
+                  # Check cooldown from failed move (30min)
+                  local cooldown_ts
+                  cooldown_ts=$(get_state "cluster" "rebalance_cooldown")
+                  if [ -n "$cooldown_ts" ]; then
+                      local cooldown_epoch now_epoch
+                      cooldown_epoch=$(date -d "$cooldown_ts" +%s 2>/dev/null || echo "0")
+                      now_epoch=$(date +%s)
+                      if [ $((now_epoch - cooldown_epoch)) -lt "$REBALANCE_COOLDOWN" ]; then
+                          return 0
+                      fi
+                      rm -f "$STATE_DIR/cluster.rebalance_cooldown"
+                  fi
+
+                  # Check debounce (5min between attempts)
+                  local now_epoch
+                  now_epoch=$(date +%s)
+                  local last_attempt
+                  last_attempt=$(get_state "cluster" "last_rebalance_attempt")
+                  if [ -n "$last_attempt" ]; then
+                      local attempt_epoch elapsed
+                      attempt_epoch=$(date -d "$last_attempt" +%s 2>/dev/null || echo "0")
+                      elapsed=$((now_epoch - attempt_epoch))
+                      if [ "$elapsed" -lt "$REBALANCE_DEBOUNCE" ]; then
+                          return 0
+                      fi
+                      # Debounce expired — check if previous move failed
+                      local pending_pod pending_node
+                      pending_pod=$(get_state "cluster" "rebalance_pending_pod")
+                      pending_node=$(get_state "cluster" "rebalance_pending_node")
+                      if [ -n "$pending_pod" ] && [ -n "$pending_node" ]; then
+                          local current_node
+                          current_node=$(kubectl get pod "$pending_pod" -n "$NS" \
+                              -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+                          if [ "$current_node" = "$pending_node" ]; then
+                              log "WARN: $pending_pod still on $pending_node after rebalance — entering 30min cooldown"
+                              set_state "cluster" "rebalance_cooldown" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                              set_state "cluster" "rebalance_pending_pod" ""
+                              set_state "cluster" "rebalance_pending_node" ""
+                              return 0
+                          fi
+                      fi
+                  fi
+
+                  # Check settle time: skip if any pod became Ready < REBALANCE_SETTLE ago
+                  for P in $pod_names; do
+                      local ready_ts
+                      ready_ts=$(kubectl get pod "$P" -n "$NS" \
+                          -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}' \
+                          2>/dev/null || echo "")
+                      if [ -n "$ready_ts" ]; then
+                          local ready_epoch
+                          ready_epoch=$(date -d "$ready_ts" +%s 2>/dev/null || echo "0")
+                          if [ $((now_epoch - ready_epoch)) -lt "$REBALANCE_SETTLE" ]; then
+                              log "Pod $P became Ready ${ready_ts} (<${REBALANCE_SETTLE}s ago) — waiting to settle"
+                              return 0
+                          fi
+                      fi
+                  done
+
+                  # Pick the highest-ordinal pod on the most-loaded node (protect server-0)
+                  local target_pod
+                  target_pod=$(grep ":${max_node}$" "$node_map_file" | \
+                      awk -F: '{print $1}' | sort -t- -k3 -n -r | head -1)
+
+                  if [ -z "$target_pod" ] || [ "$target_pod" = "${CLUSTER}-server-0" ]; then
+                      log "WARN: Would need to move server-0 — skipping (protects etcd init node)"
+                      return 0
+                  fi
+
+                  log "Rebalancing: deleting $target_pod from node $max_node (scheduler will redistribute)"
+                  set_state "cluster" "last_rebalance_attempt" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                  set_state "cluster" "rebalance_pending_pod" "$target_pod"
+                  set_state "cluster" "rebalance_pending_node" "$max_node"
+                  kubectl delete pod "$target_pod" -n "$NS" --grace-period=30 --wait=false 2>/dev/null || true
+                  log "Pod $target_pod deleted — StatefulSet controller will recreate it"
+              }
+
               # --- Main watch loop ---
               log "Starting k3k pod watcher (poll every ${POLL_INTERVAL}s)"
 
@@ -299,6 +461,9 @@ spec:
                       sleep "$POLL_INTERVAL"
                       continue
                   fi
+
+                  # --- Pod balance check (rebalance after drain/uncordon) ---
+                  check_pod_balance
 
                   # Discover all server pods via label selector
                   PODS=$(kubectl get pods -l "cluster=$CLUSTER,role=server" -n "$NS" \
