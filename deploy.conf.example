@@ -38,6 +38,8 @@ STORAGE_CLASS="harvester-longhorn"
 # =============================================================================
 
 # Number of k3k server nodes (1 = single, 3 = HA with etcd cluster)
+# HA mode (3) also deploys a PodDisruptionBudget (minAvailable=2) and patches
+# the Rancher Deployment strategy to maxUnavailable=0 for zero-downtime upgrades.
 SERVER_COUNT=1
 
 # =============================================================================
@@ -52,7 +54,7 @@ SERVER_COUNT=1
 # Rancher chart source (HTTP repo URL or OCI URI)
 # RANCHER_REPO="https://releases.rancher.com/server-charts/latest"
 # RANCHER_REPO="oci://harbor.example.com/charts/rancher"
-# RANCHER_VERSION="v2.13.2"
+# RANCHER_VERSION="v2.13.3"
 
 # k3k chart source (HTTP repo URL or OCI URI)
 # K3K_REPO="https://rancher.github.io/k3k"

@@ -101,8 +101,8 @@ and should not be edited directly.
 | `PRIVATE_REGISTRY` | Container image proxy-cache host | (none) |
 | `PRIVATE_CA_PATH` | PEM-encoded CA bundle for private TLS | (none) |
 | `CERTMANAGER_VERSION` | cert-manager Helm chart version | `v1.18.5` |
-| `RANCHER_VERSION` | Rancher Helm chart version | `v2.13.2` |
-| `K3K_VERSION` | k3k Helm chart version | `1.0.2-rc2` |
+| `RANCHER_VERSION` | Rancher Helm chart version | `v2.13.3` |
+| `K3K_VERSION` | k3k Helm chart version | `1.0.2` |
 | `HELM_AUTH_NEEDED` | Enable Helm repo authentication | `no` |
 | `CONFIRM` | Skip confirmation prompt | (interactive) |
 
@@ -284,6 +284,36 @@ resource "rancher2_cloud_credential" "harvester" {
 ./destroy.sh
 ```
 
+## HA and Zero-Downtime Upgrades
+
+When `SERVER_COUNT=3`, the deploy script applies two protections after Rancher
+is running:
+
+1. **PodDisruptionBudget** (`minAvailable: 2`) — prevents voluntary disruptions
+   (node drains, evictions) from taking down more than one Rancher pod at a time.
+2. **Deployment strategy patch** (`maxUnavailable: 0, maxSurge: 1`) — ensures a
+   replacement pod is fully Ready before its predecessor is terminated.
+
+The Rancher Helm chart hardcodes `maxUnavailable: 1` and ships no PDB, so these
+are layered on top as a post-deploy step.
+
+### Upgrade procedure
+
+```bash
+# 1. Update the version in deploy.conf
+RANCHER_VERSION="v2.13.3"
+
+# 2. Re-run deploy (idempotent — upgrades existing components)
+./deploy.sh -c deploy.conf
+```
+
+During a version upgrade, the Helm chart re-renders the Deployment and resets
+the strategy to chart defaults for that rollout. With 3 replicas and
+`maxUnavailable: 1`, at least 2 pods always serve traffic. The PDB persists
+independently and protects against concurrent disruptions (e.g., a node drain
+happening mid-upgrade). After the rollout completes, the strategy patch is
+re-applied.
+
 ## File Structure
 
 ```text
@@ -307,7 +337,8 @@ rancher-k3k/
 ├── ingress-watcher.yaml     # Deployment: event-driven ingress recovery
 ├── post-install/            # HelmChart CR templates (k3k virtual cluster)
 │   ├── 01-cert-manager.yaml
-│   └── 02-rancher.yaml
+│   ├── 02-rancher.yaml
+│   └── 03-rancher-ha.yaml   # PDB for zero-downtime HA upgrades
 ├── templates/               # CR templates for rancher-backup operator
 │   ├── backup-cr.yaml
 │   ├── restore-cr.yaml
@@ -317,6 +348,7 @@ rancher-k3k/
 │   ├── universal-backup-restore.md
 │   ├── backup-restore.md
 │   ├── certificate-change-recovery.md
+│   ├── etcd-quorum-recovery.md
 │   └── multi-cluster-observability.md
 ├── test/                    # Test environment
 │   ├── deploy-test.conf
@@ -354,8 +386,8 @@ The pod enters CrashLoopBackOff until it is rescheduled back to a node with a ma
 
 ### Experimental status
 
-k3k v1.0.2-rc2 is the minimum required version. The stable v1.0.2 release is pending.
-v1.0.2 adds `secretMounts` ([PR #570](https://github.com/rancher/k3k/pull/570)) which is required
+k3k v1.0.2 is the minimum required version.
+It adds `secretMounts` ([PR #570](https://github.com/rancher/k3k/pull/570)) which is required
 for private CA and container registry support.
 
 ## Known Issues
