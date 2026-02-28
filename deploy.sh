@@ -144,7 +144,7 @@ echo "  Enter HTTP repo URLs or OCI URIs (oci://harbor.example.com/project/chart
 prompt_or_default CERTMANAGER_REPO "cert-manager source [https://charts.jetstack.io]: " "https://charts.jetstack.io"
 prompt_or_default CERTMANAGER_VERSION "cert-manager version [v1.18.5]: " "v1.18.5"
 prompt_or_default RANCHER_REPO "Rancher source [https://releases.rancher.com/server-charts/latest]: " "https://releases.rancher.com/server-charts/latest"
-prompt_or_default RANCHER_VERSION "Rancher version [v2.13.2]: " "v2.13.2"
+prompt_or_default RANCHER_VERSION "Rancher version [v2.13.3]: " "v2.13.3"
 prompt_or_default K3K_REPO "k3k source [https://rancher.github.io/k3k]: " "https://rancher.github.io/k3k"
 prompt_or_default K3K_VERSION "k3k version [1.0.2]: " "1.0.2"
 
@@ -770,6 +770,33 @@ done
 log "Rancher deployment found, waiting for pods to be ready..."
 $K3K_CMD wait --for=condition=available deploy/rancher -n cattle-system --timeout=600s
 log "Rancher is running"
+
+# --- Zero-downtime protections (HA only) ---
+# The Rancher Helm chart hardcodes strategy maxUnavailable=1 for multi-replica
+# deployments and ships no PDB. We layer two protections on top:
+#   1. PDB (minAvailable = replicas-1) — prevents voluntary disruptions (drains,
+#      evictions) from taking down more than one pod at a time.
+#   2. Deployment strategy patch (maxUnavailable=0, maxSurge=1) — ensures a new
+#      pod is fully Ready before its predecessor is terminated.
+# On re-deploy (version upgrade), helm re-renders the Deployment and resets the
+# strategy to chart defaults during the rollout. The PDB persists independently
+# and still protects against concurrent disruptions. After the rollout the patch
+# is re-applied for subsequent changes (config edits, manual restarts, etc.).
+if [[ "$SERVER_COUNT" -ge 3 ]]; then
+    log "Applying zero-downtime protections for HA ($RANCHER_REPLICAS replicas)..."
+
+    PDB_MIN=$((RANCHER_REPLICAS - 1))
+    PDB_MANIFEST=$(mktemp)
+    sed "s|__PDB_MIN_AVAILABLE__|${PDB_MIN}|g" \
+        "$SCRIPT_DIR/post-install/03-rancher-ha.yaml" > "$PDB_MANIFEST"
+    $K3K_CMD apply -f "$PDB_MANIFEST"
+    rm -f "$PDB_MANIFEST"
+
+    $K3K_CMD -n cattle-system patch deploy/rancher --type=strategic -p \
+        '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}'
+
+    log "PDB (minAvailable=${PDB_MIN}) and rolling update strategy (maxUnavailable=0) applied"
+fi
 
 # =============================================================================
 # Step 6: Copy TLS certificate to host cluster
