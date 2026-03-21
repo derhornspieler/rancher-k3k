@@ -68,6 +68,9 @@ spec:
               REBALANCE_COOLDOWN=1800 # seconds cooldown after failed move
               log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
+              # Parse ISO 8601 timestamp to epoch (BusyBox date needs space not T, no trailing Z)
+              parse_epoch() { local ts="${1/T/ }"; date -d "${ts%Z}" +%s 2>/dev/null || echo "0"; }
+
               # Per-pod state helpers (file-based to support dynamic pod count)
               get_state() { cat "$STATE_DIR/$1.$2" 2>/dev/null || echo ""; }
               set_state() { printf '%s' "$3" > "$STATE_DIR/$1.$2"; }
@@ -198,7 +201,7 @@ spec:
                   # Check timeout for current state
                   if [ -n "$recovery_started" ]; then
                       local started_epoch now_epoch elapsed
-                      started_epoch=$(date -d "$recovery_started" +%s 2>/dev/null || echo "0")
+                      started_epoch=$(parse_epoch "$recovery_started")
                       now_epoch=$(date +%s)
                       elapsed=$((now_epoch - started_epoch))
                       if [ "$elapsed" -gt "$RECOVERY_TIMEOUT" ]; then
@@ -369,7 +372,7 @@ spec:
                   cooldown_ts=$(get_state "cluster" "rebalance_cooldown")
                   if [ -n "$cooldown_ts" ]; then
                       local cooldown_epoch now_epoch
-                      cooldown_epoch=$(date -d "$cooldown_ts" +%s 2>/dev/null || echo "0")
+                      cooldown_epoch=$(parse_epoch "$cooldown_ts")
                       now_epoch=$(date +%s)
                       if [ $((now_epoch - cooldown_epoch)) -lt "$REBALANCE_COOLDOWN" ]; then
                           return 0
@@ -384,7 +387,7 @@ spec:
                   last_attempt=$(get_state "cluster" "last_rebalance_attempt")
                   if [ -n "$last_attempt" ]; then
                       local attempt_epoch elapsed
-                      attempt_epoch=$(date -d "$last_attempt" +%s 2>/dev/null || echo "0")
+                      attempt_epoch=$(parse_epoch "$last_attempt")
                       elapsed=$((now_epoch - attempt_epoch))
                       if [ "$elapsed" -lt "$REBALANCE_DEBOUNCE" ]; then
                           return 0
@@ -415,7 +418,7 @@ spec:
                           2>/dev/null || echo "")
                       if [ -n "$ready_ts" ]; then
                           local ready_epoch
-                          ready_epoch=$(date -d "$ready_ts" +%s 2>/dev/null || echo "0")
+                          ready_epoch=$(parse_epoch "$ready_ts")
                           if [ $((now_epoch - ready_epoch)) -lt "$REBALANCE_SETTLE" ]; then
                               log "Pod $P became Ready ${ready_ts} (<${REBALANCE_SETTLE}s ago) — waiting to settle"
                               return 0
