@@ -644,7 +644,7 @@ fi
 # k3k API access always uses --insecure-skip-tls-verify because k3s generates
 # internal certs with SANs (k3k-rancher-server-0, kubernetes, localhost) that
 # violate root CA name constraints. The custom CA is used for Rancher leaf certs
-# (which have *.aegisgroup.ch SANs and pass validation), not the k3k API server.
+# (which have the configured domain SANs and pass validation), not the k3k API server.
 K3K_CMD="kubectl --kubeconfig=$KUBECONFIG_FILE --insecure-skip-tls-verify"
 # Retry connectivity check — ingress SSL passthrough may take a few seconds to propagate
 ATTEMPTS=0

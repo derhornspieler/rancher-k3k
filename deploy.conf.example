@@ -13,8 +13,20 @@
 # (REQUIRED) Rancher hostname — must resolve to the Harvester VIP or load balancer
 HOSTNAME="rancher.example.com"
 
+# Comma-separated list of all FQDNs for Rancher (multi-FQDN support).
+# First entry is the primary hostname. All are added to cert-manager dnsNames
+# and host ingress rules. If unset, falls back to HOSTNAME.
+# HOSTNAMES="rancher.example.com,rancher.short.example.com"
+
+# k3k API server hostname(s) — exposed via ingress with SSL passthrough on port 443.
+# Comma-separated, first is primary (used in kubeconfig). Leave empty for NodePort access.
+# K3K_API_HOSTNAME="k3k.example.com"
+
+# Use private CA for k3k API server TLS (uses CA_CERT_PATH/CA_KEY_PATH)
+# CUSTOM_CA="true"
+
 # Bootstrap password for initial Rancher login (min 12 characters)
-BOOTSTRAP_PW="admin1234567"
+BOOTSTRAP_PW="<CHANGE_ME_MIN_12_CHARS>"
 
 # Skip confirmation prompt (set to "yes" for non-interactive deploys)
 CONFIRM="yes"

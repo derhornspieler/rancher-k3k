@@ -63,18 +63,18 @@ kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" -o yaml
 
 Look for these annotations in the output:
 
-- `k3k.aegisgroup.ch/etcd-recovery-state` — recovery state (scaling-down, resetting, scaling-up, failed, or missing)
-- `k3k.aegisgroup.ch/etcd-original-servers` — original server count before recovery
-- `k3k.aegisgroup.ch/etcd-recovery-started` — ISO 8601 timestamp when recovery began
+- `k3k.io/etcd-recovery-state` — recovery state (scaling-down, resetting, scaling-up, failed, or missing)
+- `k3k.io/etcd-original-servers` — original server count before recovery
+- `k3k.io/etcd-recovery-started` — ISO 8601 timestamp when recovery began
 
 Expected output structure:
 
 ```yaml
 metadata:
   annotations:
-    k3k.aegisgroup.ch/etcd-recovery-state: "failed"
-    k3k.aegisgroup.ch/etcd-original-servers: "3"
-    k3k.aegisgroup.ch/etcd-recovery-started: "2026-02-26T12:00:00Z"
+    k3k.io/etcd-recovery-state: "failed"
+    k3k.io/etcd-original-servers: "3"
+    k3k.io/etcd-recovery-started: "2026-02-26T12:00:00Z"
   name: rancher
   namespace: rancher-k3k
 spec:
@@ -242,7 +242,7 @@ CLUSTER="rancher"
 
 # 1. Check what state timed out
 kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
-  -o jsonpath='{.metadata.annotations.k3k\.aegisgroup\.ch/etcd-recovery-state}'
+  -o jsonpath='{.metadata.annotations.k3k\.io/etcd-recovery-state}'
 # Output: failed
 
 # 2. Check watcher logs for the exact error
@@ -254,9 +254,9 @@ Now use the **Manual Recovery — Spec Patch Method** below:
 ```bash
 # 3. Clear the failed recovery annotations
 kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" --overwrite \
-  "k3k.aegisgroup.ch/etcd-recovery-state=" \
-  "k3k.aegisgroup.ch/etcd-original-servers=" \
-  "k3k.aegisgroup.ch/etcd-recovery-started="
+  "k3k.io/etcd-recovery-state=" \
+  "k3k.io/etcd-original-servers=" \
+  "k3k.io/etcd-recovery-started="
 # Note: Use '=' (not '-') to clear all three in one command
 
 # 4. Verify annotations are cleared
@@ -298,9 +298,9 @@ ORIGINAL_SERVERS=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
 echo "Original server count: $ORIGINAL_SERVERS"
 
 kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" --overwrite \
-  "k3k.aegisgroup.ch/etcd-recovery-state=scaling-down" \
-  "k3k.aegisgroup.ch/etcd-original-servers=$ORIGINAL_SERVERS" \
-  "k3k.aegisgroup.ch/etcd-recovery-started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "k3k.io/etcd-recovery-state=scaling-down" \
+  "k3k.io/etcd-original-servers=$ORIGINAL_SERVERS" \
+  "k3k.io/etcd-recovery-started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # 3. Scale down to 1 server
 echo "Scaling down to 1 server..."
@@ -400,9 +400,9 @@ fi
 # 8. Clean up annotations
 echo "Cleaning up recovery annotations..."
 kubectl annotate clusters.k3k.io "$CLUSTER" -n "$NS" \
-  k3k.aegisgroup.ch/etcd-recovery-state- \
-  k3k.aegisgroup.ch/etcd-original-servers- \
-  k3k.aegisgroup.ch/etcd-recovery-started-
+  k3k.io/etcd-recovery-state- \
+  k3k.io/etcd-original-servers- \
+  k3k.io/etcd-recovery-started-
 
 # 9. Verify Rancher is healthy
 echo "Verifying Rancher is healthy..."
@@ -410,7 +410,7 @@ RANCHER_URL=$(kubectl get clusters.k3k.io "$CLUSTER" -n "$NS" \
   -o jsonpath='{.spec.serverArgs}' | grep -oP '(?<=--tls-san=).*?(?=\s|$)' | head -1)
 
 if [ -z "$RANCHER_URL" ]; then
-  RANCHER_URL="rancher.aegisgroup.ch"  # Fallback
+  RANCHER_URL="rancher.example.com"  # Fallback
 fi
 
 curl -sk "https://${RANCHER_URL}/ping" || echo "WARNING: Could not verify Rancher health"
@@ -456,7 +456,7 @@ If etcd data is corrupted and cannot be recovered with `cluster-reset`, restore 
 NS="rancher-k3k"
 CLUSTER="rancher"
 MINIO_BUCKET="rancher-backups"
-MINIO_ENDPOINT="172.16.3.249:9000"
+MINIO_ENDPOINT="minio.example.com:9000"
 
 # 1. List available backups in MinIO
 echo "=== Available backups in MinIO ==="
@@ -467,7 +467,7 @@ aws s3api list-objects-v2 \
   --query 'Contents[].{Key:Key, Size:Size, LastModified:LastModified}' \
   --output table
 # Note: Requires AWS CLI configured with MinIO credentials
-# If you don't have AWS CLI, use the MinIO web console at https://minio.aegisgroup.ch
+# If you don't have AWS CLI, use the MinIO web console at https://minio.example.com
 
 # 2. Choose the most recent backup before the failure
 # Format: rancher-backups/YYYY-MM-DD/HHMMSS-<backup-name>.tar.gz
@@ -503,7 +503,7 @@ aws s3api get-object \
   "$BACKUP_DIR/backup.tar.gz"
 
 # Option B: Using MinIO mc client
-# mc alias set minio https://minio.aegisgroup.ch <access-key> <secret-key>
+# mc alias set minio https://minio.example.com <access-key> <secret-key>
 # mc cp "minio/$MINIO_BUCKET/$BACKUP_KEY" "$BACKUP_DIR/backup.tar.gz"
 
 # 6. Extract backup
@@ -624,7 +624,7 @@ kubectl exec -it "${CLUSTER}-server-0" -n "$NS" -- sh -c \
     member list -w table' 2>/dev/null || echo "(requires k3k kubeconfig)"
 
 # 4. Verify Rancher is accessible and healthy
-HOSTNAME="rancher.aegisgroup.ch"
+HOSTNAME="rancher.example.com"
 echo "=== Rancher Health Check ==="
 curl -sk "https://${HOSTNAME}/ping"
 # Expected: pong

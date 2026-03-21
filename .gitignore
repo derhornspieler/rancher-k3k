@@ -31,8 +31,14 @@ backups/
 .DS_Store
 Thumbs.db
 
+# Deploy config (contains real hostnames, passwords, CA paths)
+deploy.conf
+
 # Claude
 .claude/
+
+# Superpowers plans (local planning docs)
+docs/superpowers/
 
 # Sync script (private tooling)
 scripts/
