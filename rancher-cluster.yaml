@@ -2,8 +2,14 @@
 # k3k Virtual Cluster for Rancher
 # Apply this after the k3k controller is running.
 #
-# IMPORTANT: k3k does NOT support embedded manifests like vCluster.
-# After the cluster is ready, deploy Rancher using the post-install/ manifests.
+# Placeholders replaced by deploy.sh:
+#   __SERVER_COUNT__    - Number of server nodes (1 or 3)
+#   __PVC_SIZE__        - PVC storage size
+#   __STORAGE_CLASS__   - Kubernetes StorageClass name
+#   __TLS_SANS__        - TLS Subject Alternative Names (injected by deploy.sh)
+#   __EXTRA_SERVER_ARGS__ - Additional K3s server arguments
+#   __SECRET_MOUNTS__   - Secret mount configuration
+#   __CUSTOM_CAS__      - Custom CA configuration (injected by deploy.sh)
 ---
 apiVersion: v1
 kind: Namespace
@@ -28,25 +34,37 @@ spec:
   serviceCIDR: 10.43.0.0/16
 
   # Persist cluster data
-  # Minimum 10Gi for base Rancher. Increase for monitoring/logging:
-  #   50Gi   - Rancher + basic monitoring
-  #   200Gi  - Rancher + Prometheus + Grafana + Loki
-  #   500Gi  - Full observability stack with retention
   persistence:
     type: dynamic
     storageClassName: __STORAGE_CLASS__
     storageRequestSize: __PVC_SIZE__
 
-  # Disable the network policy controller to prevent flannel crash on pod reschedule.
-  # When the k3k server pod moves to a different node, flannel's network policy
-  # controller reads stale node IP from etcd and crashes. This flag disables only
-  # the policy controller — flannel itself still works for pod networking.
-  # See: https://github.com/rancher/k3k/issues/657
+  # Disable network policy controller (stale node IP crash on reschedule)
+  # Disable Traefik (host NGINX handles ingress via native sync)
   serverArgs:
     - "--disable-network-policy"
+    - "--disable=traefik"
 __EXTRA_SERVER_ARGS__
 
 __SECRET_MOUNTS__
-  # Expose cluster API via NodePort
+
+  # Expose k3k API via ingress (SSL passthrough, firewall-friendly port 443)
   expose:
-    nodePort: {}
+    ingress:
+      ingressClassName: nginx
+      annotations:
+        nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+
+  # TLS Subject Alternative Names for the k3k API server certificate
+  tlsSANs:
+__TLS_SANS__
+
+  # Sync resources from vCluster to host cluster
+  # Ingresses + services enabled: replaces manual host-ingress.yaml and rancher-k3k-traefik service
+  sync:
+    ingresses:
+      enabled: true
+    services:
+      enabled: true
+
+__CUSTOM_CAS__
