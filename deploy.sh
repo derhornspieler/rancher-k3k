@@ -915,6 +915,45 @@ if [[ "$SERVER_COUNT" -ge 3 ]]; then
     log "PDB (minAvailable=${PDB_MIN}) and rolling update strategy (maxUnavailable=0) applied"
 fi
 
+# Create additional vCluster ingresses for extra Rancher FQDNs.
+# The Rancher Helm chart only supports a single hostname. Extra FQDNs need
+# their own ingress rules inside the vCluster so Traefik routes them to Rancher.
+if [[ "${#HOSTNAME_ARRAY[@]}" -gt 1 ]]; then
+    log "Creating vCluster ingress rules for additional FQDNs..."
+    for H in "${HOSTNAME_ARRAY[@]}"; do
+        [[ "$H" == "$PRIMARY_HOSTNAME" ]] && continue
+        $K3K_CMD apply -f - <<EXTRA_INGRESS_EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-$(echo "$H" | tr '.' '-')
+  namespace: cattle-system
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "1800"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "1800"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: "${H}"
+      http:
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: rancher
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - "${H}"
+      secretName: tls-rancher-ingress
+EXTRA_INGRESS_EOF
+        log "  Added vCluster ingress for ${H}"
+    done
+fi
+
 # =============================================================================
 # Step 5.5: Copy TLS certificate to host cluster for Rancher ingress
 # =============================================================================
