@@ -36,7 +36,7 @@ __REPO_CA_LINE1__
 __REPO_CA_LINE2__
   set:
     ingress.tls.source: __TLS_SOURCE__
-    ingress.ingressClassName: nginx
+    ingress.ingressClassName: traefik
     hostname: __HOSTNAME__
     replicas: __RANCHER_REPLICAS__
     global.cattle.psp.enabled: "false"

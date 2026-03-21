@@ -64,6 +64,26 @@ if [[ -n "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
 fi
 
+# Multi-FQDN support: HOSTNAMES takes precedence over HOSTNAME
+if [[ -n "${HOSTNAMES:-}" ]]; then
+    PRIMARY_HOSTNAME="${HOSTNAMES%%,*}"
+    IFS=',' read -ra HOSTNAME_ARRAY <<< "$HOSTNAMES"
+else
+    PRIMARY_HOSTNAME=""  # Set after HOSTNAME validation below
+    HOSTNAME_ARRAY=()
+fi
+
+# k3k API hostname(s) — comma-separated, first is primary (used in kubeconfig)
+K3K_API_HOSTNAME="${K3K_API_HOSTNAME:-}"
+if [[ -n "$K3K_API_HOSTNAME" ]]; then
+    PRIMARY_K3K_API="${K3K_API_HOSTNAME%%,*}"
+    IFS=',' read -ra K3K_API_ARRAY <<< "$K3K_API_HOSTNAME"
+else
+    PRIMARY_K3K_API=""
+    K3K_API_ARRAY=()
+fi
+CUSTOM_CA="${CUSTOM_CA:-}"
+
 # prompt_or_default VAR "prompt text" "default_value"
 # If VAR is already set (from config file), skip the prompt.
 # If no config file, prompt interactively; if config file, use the default.
@@ -100,6 +120,12 @@ fi
 if [[ -z "$HOSTNAME" ]]; then
     err "Hostname is required"
     exit 1
+fi
+
+# Finalize multi-FQDN: if HOSTNAMES was not set, use HOSTNAME
+if [[ -z "$PRIMARY_HOSTNAME" ]]; then
+    PRIMARY_HOSTNAME="$HOSTNAME"
+    HOSTNAME_ARRAY=("$HOSTNAME")
 fi
 
 prompt_or_default BOOTSTRAP_PW "Bootstrap password (min 12 chars) [admin1234567]: " "admin1234567"
@@ -300,7 +326,9 @@ fi
 # --- Confirm ---
 echo ""
 echo -e "${CYAN}Configuration Summary:${NC}"
-echo "  Hostname:         $HOSTNAME"
+echo "  Hostname:         $PRIMARY_HOSTNAME"
+[[ "${#HOSTNAME_ARRAY[@]}" -gt 1 ]] && echo "  All FQDNs:        ${HOSTNAME_ARRAY[*]}"
+[[ -n "$PRIMARY_K3K_API" ]] && echo "  k3k API:          ${K3K_API_ARRAY[*]}"
 echo "  Password:         ****"
 echo "  PVC Size:         $PVC_SIZE"
 echo "  Storage Class:    $STORAGE_CLASS"
@@ -405,7 +433,7 @@ fi
 # Step 1: Install/upgrade k3k controller via Helm
 # =============================================================================
 echo ""
-log "Step 1/9: Installing k3k controller..."
+log "Step 1/7: Installing k3k controller..."
 if is_oci "$K3K_REPO"; then
     # OCI: install directly from OCI URI (no helm repo add)
     if helm status k3k -n k3k-system &>/dev/null; then
@@ -477,9 +505,54 @@ elif [[ -n "$PRIVATE_REGISTRY" ]]; then
 fi
 
 # =============================================================================
+# Step 1.6: Ensure NGINX ingress controller has SSL passthrough enabled
+# =============================================================================
+# k3k exposes its API server via ingress with ssl-passthrough annotation.
+# RKE2/Harvester NGINX needs --enable-ssl-passthrough in its extraArgs.
+# This is idempotent and only activates per-ingress when the annotation is set.
+if [[ -n "$PRIMARY_K3K_API" ]]; then
+    log "Ensuring NGINX ingress controller has SSL passthrough enabled..."
+    CURRENT_ARGS=$(kubectl get helmchartconfig rke2-ingress-nginx -n kube-system \
+        -o jsonpath='{.spec.valuesContent}' 2>/dev/null || echo "")
+    if ! echo "$CURRENT_ARGS" | grep -q "enable-ssl-passthrough"; then
+        log "Patching HelmChartConfig to enable SSL passthrough..."
+        # Read current valuesContent, inject the flag, and apply back
+        VALS_FILE=$(mktemp)
+        kubectl get helmchartconfig rke2-ingress-nginx -n kube-system \
+            -o jsonpath='{.spec.valuesContent}' > "$VALS_FILE"
+        if grep -q "extraArgs:" "$VALS_FILE"; then
+            sed -i '/extraArgs:/a\        enable-ssl-passthrough: "true"' "$VALS_FILE"
+        else
+            sed -i '/^controller:/a\    extraArgs:\n        enable-ssl-passthrough: "true"' "$VALS_FILE"
+        fi
+        # Rebuild the HelmChartConfig with the patched values
+        PATCH_MANIFEST=$(mktemp)
+        cat > "$PATCH_MANIFEST" <<HCCEOF
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-ingress-nginx
+  namespace: kube-system
+spec:
+  valuesContent: |
+$(sed 's/^/    /' "$VALS_FILE")
+HCCEOF
+        kubectl apply -f "$PATCH_MANIFEST"
+        rm -f "$VALS_FILE" "$PATCH_MANIFEST"
+        # Wait for the controller pods to restart with new args
+        log "Waiting for NGINX controller pods to restart..."
+        sleep 5
+        kubectl rollout status daemonset/rke2-ingress-nginx-controller -n kube-system --timeout=120s 2>/dev/null || true
+        log "NGINX SSL passthrough enabled"
+    else
+        log "NGINX SSL passthrough already enabled"
+    fi
+fi
+
+# =============================================================================
 # Step 2: Create k3k virtual cluster
 # =============================================================================
-log "Step 2/9: Creating k3k virtual cluster..."
+log "Step 2/7: Creating k3k virtual cluster..."
 if kubectl get clusters.k3k.io "$K3K_CLUSTER" -n "$K3K_NS" &>/dev/null; then
     log "k3k cluster already exists, skipping"
 else
@@ -489,6 +562,25 @@ else
         -e "s|__SERVER_COUNT__|${SERVER_COUNT}|g" \
         "$SCRIPT_DIR/rancher-cluster.yaml" > "$CLUSTER_MANIFEST"
     inject_secret_mounts "$CLUSTER_MANIFEST"
+
+    # Inject tlsSANs — only k3k API hostname + internal names.
+    # Do NOT include Rancher FQDNs here: k3k creates an SSL passthrough ingress
+    # from these SANs, which would intercept Rancher traffic. Rancher gets its
+    # own ingress via native ingress sync from the vCluster.
+    TLS_SANS_BLOCK=""
+    for K in "${K3K_API_ARRAY[@]}"; do
+        TLS_SANS_BLOCK="${TLS_SANS_BLOCK}    - \"${K}\"\n"
+    done
+    TLS_SANS_BLOCK="${TLS_SANS_BLOCK}    - k3k-rancher-service\n"
+    TLS_SANS_BLOCK="${TLS_SANS_BLOCK}    - k3k-rancher-service.rancher-k3k"
+    sedi "s|^__TLS_SANS__$|${TLS_SANS_BLOCK}|" "$CLUSTER_MANIFEST"
+
+    # customCAs: Disabled. k3k's customCAs injects our CA into k3s internal cert
+    # generation, but k3s creates certs with SANs (k3k-rancher-server-0, kubernetes,
+    # localhost) that violate root CA name constraints. Let k3k generate its own
+    # internal CAs; our CA is used only for Rancher leaf certs via cert-manager.
+    sedi "/__CUSTOM_CAS__/d" "$CLUSTER_MANIFEST"
+
     kubectl apply -f "$CLUSTER_MANIFEST"
     rm -f "$CLUSTER_MANIFEST"
 fi
@@ -523,30 +615,48 @@ log "k3k cluster is Ready"
 # =============================================================================
 # Step 3: Extract kubeconfig
 # =============================================================================
-log "Step 3/9: Extracting kubeconfig..."
+log "Step 3/7: Extracting kubeconfig..."
 KUBECONFIG_FILE=$(mktemp)
 
 kubectl get secret "k3k-${K3K_CLUSTER}-kubeconfig" -n "$K3K_NS" \
     -o jsonpath='{.data.kubeconfig\.yaml}' | base64 -d > "$KUBECONFIG_FILE"
 
-# Replace ClusterIP with NodePort address
+# Rewrite kubeconfig server URL for external access
 CLUSTER_IP=$(sed -n 's/.*server: https:\/\/\([^:]*\).*/\1/p' "$KUBECONFIG_FILE")
-NODE_PORT=$(kubectl get svc "k3k-${K3K_CLUSTER}-service" -n "$K3K_NS" \
-    -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
-NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
-if [[ -n "$NODE_PORT" && -n "$NODE_IP" ]]; then
-    sedi "s|server: https://${CLUSTER_IP}|server: https://${NODE_IP}:${NODE_PORT}|" "$KUBECONFIG_FILE"
-    log "Kubeconfig updated: https://${NODE_IP}:${NODE_PORT}"
+if [[ -n "$PRIMARY_K3K_API" ]]; then
+    # Ingress mode: use primary k3k API hostname on standard port 443
+    sedi "s|server: https://${CLUSTER_IP}[^\"]*|server: https://${PRIMARY_K3K_API}|" "$KUBECONFIG_FILE"
+    log "Kubeconfig updated: https://${PRIMARY_K3K_API}"
 else
-    warn "Could not determine NodePort. Using ClusterIP (only works from within the cluster)."
+    # Fallback: NodePort mode
+    NODE_PORT=$(kubectl get svc "k3k-${K3K_CLUSTER}-service" -n "$K3K_NS" \
+        -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+    if [[ -n "$NODE_PORT" && -n "$NODE_IP" ]]; then
+        sedi "s|server: https://${CLUSTER_IP}|server: https://${NODE_IP}:${NODE_PORT}|" "$KUBECONFIG_FILE"
+        log "Kubeconfig updated: https://${NODE_IP}:${NODE_PORT}"
+    else
+        warn "Could not determine NodePort. Using ClusterIP (only works from within the cluster)."
+    fi
 fi
 
+# k3k API access always uses --insecure-skip-tls-verify because k3s generates
+# internal certs with SANs (k3k-rancher-server-0, kubernetes, localhost) that
+# violate root CA name constraints. The custom CA is used for Rancher leaf certs
+# (which have *.aegisgroup.ch SANs and pass validation), not the k3k API server.
 K3K_CMD="kubectl --kubeconfig=$KUBECONFIG_FILE --insecure-skip-tls-verify"
-if ! $K3K_CMD get nodes &>/dev/null; then
-    err "Cannot connect to k3k cluster"
-    exit 1
-fi
+# Retry connectivity check — ingress SSL passthrough may take a few seconds to propagate
+ATTEMPTS=0
+while ! $K3K_CMD get nodes &>/dev/null; do
+    if [[ $ATTEMPTS -ge 12 ]]; then
+        err "Cannot connect to k3k cluster after 60s"
+        err "Check: $K3K_CMD get nodes"
+        exit 1
+    fi
+    ATTEMPTS=$((ATTEMPTS + 1))
+    sleep 5
+done
 log "Connected to k3k virtual cluster"
 
 # =============================================================================
@@ -603,7 +713,7 @@ fi
 # =============================================================================
 # Step 4: Deploy cert-manager
 # =============================================================================
-log "Step 4/9: Deploying cert-manager..."
+log "Step 4/7: Deploying cert-manager..."
 
 CERTMANAGER_MANIFEST=$(mktemp)
 sed -e "s|__CERTMANAGER_CHART__|${CERTMANAGER_CHART}|g" \
@@ -681,8 +791,9 @@ spec:
     secretName: ca-signing-keypair
 ISSUER_EOF
 
-    # Create the Certificate CR for Rancher
-    $K3K_CMD apply -f - <<CERT_EOF
+    # Create the Certificate CR for Rancher (all FQDNs)
+    CERT_MANIFEST=$(mktemp)
+    cat > "$CERT_MANIFEST" <<'CERT_HEADER'
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -694,10 +805,16 @@ spec:
     name: ca-issuer
     kind: Issuer
   dnsNames:
-    - "${HOSTNAME}"
+CERT_HEADER
+    for H in "${HOSTNAME_ARRAY[@]}"; do
+        echo "    - \"${H}\"" >> "$CERT_MANIFEST"
+    done
+    cat >> "$CERT_MANIFEST" <<'CERT_FOOTER'
   duration: 2160h
   renewBefore: 360h
-CERT_EOF
+CERT_FOOTER
+    $K3K_CMD apply -f "$CERT_MANIFEST"
+    rm -f "$CERT_MANIFEST"
 
     # Create tls-ca secret (Rancher reads this for /cacerts endpoint)
     # Uses CA_ROOT_PATH (root CA cert) as the trust anchor so downstream
@@ -709,16 +826,16 @@ CERT_EOF
     # Wait for the certificate to be issued
     log "Waiting for CA-signed certificate to be issued..."
     $K3K_CMD wait --for=condition=Ready certificate/tls-rancher-ingress -n cattle-system --timeout=120s
-    log "CA-signed certificate issued for $HOSTNAME"
+    log "CA-signed certificate issued for ${HOSTNAME_ARRAY[*]}"
 fi
 
 # =============================================================================
 # Step 5: Deploy Rancher
 # =============================================================================
-log "Step 5/9: Deploying Rancher..."
+log "Step 5/7: Deploying Rancher..."
 
 RANCHER_MANIFEST=$(mktemp)
-sed -e "s|__HOSTNAME__|${HOSTNAME}|g" \
+sed -e "s|__HOSTNAME__|${PRIMARY_HOSTNAME}|g" \
     -e "s|__BOOTSTRAP_PW__|${BOOTSTRAP_PW}|g" \
     -e "s|__RANCHER_CHART__|${RANCHER_CHART}|g" \
     -e "s|__RANCHER_VERSION__|${RANCHER_VERSION}|g" \
@@ -799,9 +916,13 @@ if [[ "$SERVER_COUNT" -ge 3 ]]; then
 fi
 
 # =============================================================================
-# Step 6: Copy TLS certificate to host cluster
+# Step 5.5: Copy TLS certificate to host cluster for Rancher ingress
 # =============================================================================
-log "Step 6/9: Copying Rancher TLS certificate to host cluster..."
+# k3k's ingress sync is not yet functional (v1.0.2) — the syncer doesn't
+# copy ingresses/services from the vCluster to the host. We manually copy
+# the TLS cert and create the host ingress for Rancher. The k3k API server
+# is separately exposed via its own SSL passthrough ingress (created by k3k).
+log "Step 5.5: Copying Rancher TLS certificate to host cluster..."
 
 ATTEMPTS=0
 while ! $K3K_CMD get secret tls-rancher-ingress -n cattle-system &>/dev/null; do
@@ -823,29 +944,90 @@ kubectl -n "$K3K_NS" create secret tls tls-rancher-ingress \
 log "TLS certificate copied to host cluster"
 
 # =============================================================================
-# Step 7: Create host ingress
+# Step 5.6: Create host ingress for Rancher
 # =============================================================================
-log "Step 7/9: Creating host cluster ingress..."
+log "Step 5.6: Creating host cluster ingress for Rancher..."
 
-sed "s|__HOSTNAME__|${HOSTNAME}|g" "$SCRIPT_DIR/host-ingress.yaml" | kubectl apply -f -
+# Create a service targeting Traefik (port 443) inside the k3k server pods.
+# k3k-rancher-service maps to port 6443 (k3s API); Traefik listens on 443.
+kubectl apply -f - <<'SVC_EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: rancher-traefik
+  namespace: rancher-k3k
+spec:
+  type: ClusterIP
+  selector:
+    cluster: rancher
+    role: server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443
+SVC_EOF
 
-log "Host ingress created"
+# Build Rancher host ingress pointing to Traefik inside vCluster (HTTPS backend)
+RANCHER_INGRESS=$(mktemp)
+cat > "$RANCHER_INGRESS" <<'INGRESS_HEADER'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-ingress
+  namespace: rancher-k3k
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "1800"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "1800"
+spec:
+  ingressClassName: nginx
+  tls:
+INGRESS_HEADER
+for H in "${HOSTNAME_ARRAY[@]}"; do
+    echo "    - hosts:" >> "$RANCHER_INGRESS"
+    echo "        - \"${H}\"" >> "$RANCHER_INGRESS"
+    echo "      secretName: tls-rancher-ingress" >> "$RANCHER_INGRESS"
+done
+cat >> "$RANCHER_INGRESS" <<'INGRESS_RULES_HEADER'
+  rules:
+INGRESS_RULES_HEADER
+for H in "${HOSTNAME_ARRAY[@]}"; do
+    cat >> "$RANCHER_INGRESS" <<INGRESS_RULE
+    - host: "${H}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rancher-traefik
+                port:
+                  number: 443
+INGRESS_RULE
+done
+kubectl apply -f "$RANCHER_INGRESS"
+rm -f "$RANCHER_INGRESS"
+
+log "Host ingress created for ${HOSTNAME_ARRAY[*]}"
 
 # =============================================================================
-# Step 8: Deploy ingress reconciler and watcher
+# Step 6: Deploy k3k-watcher
 # =============================================================================
-log "Step 8/9: Deploying ingress reconciler and watcher..."
+log "Step 6/7: Deploying k3k-watcher..."
 
-sed "s|__HOSTNAME__|${HOSTNAME}|g" "$SCRIPT_DIR/ingress-reconciler.yaml" | kubectl apply -f -
-sed "s|__HOSTNAME__|${HOSTNAME}|g" "$SCRIPT_DIR/ingress-watcher.yaml" | kubectl apply -f -
+kubectl apply -f "$SCRIPT_DIR/k3k-watcher-rbac.yaml"
+kubectl apply -f "$SCRIPT_DIR/k3k-watcher.yaml"
 
-log "Ingress watcher deployed (reacts within 30s of pod restart)"
-log "Ingress reconciler deployed (safety net, checks every 5 minutes)"
+log "k3k-watcher deployed (etcd recovery + pod rebalancing)"
 
 # =============================================================================
-# Step 9: Merge kubeconfig
+# Step 7: Merge kubeconfig
 # =============================================================================
-log "Step 9/9: Merging kubeconfig with default config..."
+log "Step 7/7: Merging kubeconfig with default config..."
 
 K3K_RENAMED=$(mktemp)
 cp "$KUBECONFIG_FILE" "$K3K_RENAMED"
@@ -873,7 +1055,8 @@ if [[ -n "$OLD_USER" && "$OLD_USER" != "rancher-k3k" ]]; then
     sedi "s|^- name: ${OLD_USER}$|- name: rancher-k3k|" "$K3K_RENAMED"
 fi
 
-# Set insecure-skip-tls-verify on the cluster entry
+# k3k API always needs insecure-skip-tls-verify (k3s internal cert SANs
+# don't match root CA name constraints — see Step 3 comment)
 kubectl --kubeconfig="$K3K_RENAMED" config set-cluster rancher-k3k --insecure-skip-tls-verify=true >/dev/null
 
 # Merge k3k config with default kubeconfig
@@ -901,7 +1084,16 @@ echo -e "${GREEN}=========================================${NC}"
 echo -e "${GREEN} Rancher deployed successfully!${NC}"
 echo -e "${GREEN}=========================================${NC}"
 echo ""
-echo -e " URL:           https://${HOSTNAME}"
+echo -e " Rancher URL:   https://${PRIMARY_HOSTNAME}"
+for H in "${HOSTNAME_ARRAY[@]}"; do
+    [[ "$H" != "$PRIMARY_HOSTNAME" ]] && echo -e "                https://${H}"
+done
+if [[ -n "$PRIMARY_K3K_API" ]]; then
+    echo -e " k3k API:       https://${PRIMARY_K3K_API}"
+    for K in "${K3K_API_ARRAY[@]}"; do
+        [[ "$K" != "$PRIMARY_K3K_API" ]] && echo -e "                https://${K}"
+    done
+fi
 echo -e " Password:      ${BOOTSTRAP_PW}"
 echo -e " PVC Size:      ${PVC_SIZE}"
 [[ -n "$PRIVATE_REGISTRY" ]] && echo -e " Registry:      ${PRIVATE_REGISTRY}"
@@ -915,8 +1107,7 @@ echo "   kubectl config use-context rancher-k3k"
 echo "   kubectl get pods -A"
 echo ""
 echo " To access k3k cluster directly:"
-echo "   export KUBECONFIG=${KUBECONFIG_FILE}"
-echo "   kubectl --insecure-skip-tls-verify get pods -A"
+echo "   kubectl --kubeconfig=${KUBECONFIG_FILE} --insecure-skip-tls-verify get pods -A"
 echo ""
 echo " To destroy:"
 echo "   $(dirname "$0")/destroy.sh"

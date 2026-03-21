@@ -47,8 +47,8 @@ monitor_ns() {
 
 echo -e "${YELLOW}This will destroy the k3k Rancher deployment.${NC}"
 echo "The following will be removed:"
-echo "  - Ingress watcher, reconciler CronJob, RBAC (rancher-k3k namespace)"
-echo "  - Host cluster ingress, service, and TLS secret (rancher-k3k namespace)"
+echo "  - k3k-watcher deployment and RBAC (rancher-k3k namespace)"
+echo "  - Legacy host resources if present (ingress, service, CronJob, TLS secret)"
 echo "  - k3k virtual cluster and all data inside it"
 echo "  - k3k controller (Helm release)"
 echo "  - rancher-k3k context/cluster/user from ~/.kube/config"
@@ -83,19 +83,28 @@ fi
 
 echo ""
 
-# --- Step 1: Remove ingress watcher and reconciler ---
-log "Step 1/6: Removing ingress watcher and reconciler..."
-kubectl delete deploy ingress-watcher -n "$K3K_NS" 2>/dev/null && log "  Watcher Deployment deleted" || warn "  Watcher Deployment not found"
-kubectl delete cronjob ingress-reconciler -n "$K3K_NS" 2>/dev/null && log "  CronJob deleted" || warn "  CronJob not found"
-kubectl delete rolebinding ingress-reconciler -n "$K3K_NS" 2>/dev/null && log "  RoleBinding deleted" || warn "  RoleBinding not found"
-kubectl delete role ingress-reconciler -n "$K3K_NS" 2>/dev/null && log "  Role deleted" || warn "  Role not found"
-kubectl delete serviceaccount ingress-reconciler -n "$K3K_NS" 2>/dev/null && log "  ServiceAccount deleted" || warn "  ServiceAccount not found"
+# --- Step 1: Remove k3k-watcher and RBAC ---
+log "Step 1/6: Removing k3k-watcher..."
+kubectl delete deploy k3k-watcher -n "$K3K_NS" 2>/dev/null && log "  Watcher Deployment deleted" || warn "  Watcher Deployment not found"
+kubectl delete clusterrolebinding k3k-watcher-nodes 2>/dev/null && log "  ClusterRoleBinding deleted" || warn "  ClusterRoleBinding not found"
+kubectl delete clusterrole k3k-watcher-nodes 2>/dev/null && log "  ClusterRole deleted" || warn "  ClusterRole not found"
+kubectl delete rolebinding k3k-watcher -n "$K3K_NS" 2>/dev/null && log "  RoleBinding deleted" || warn "  RoleBinding not found"
+kubectl delete role k3k-watcher -n "$K3K_NS" 2>/dev/null && log "  Role deleted" || warn "  Role not found"
+kubectl delete serviceaccount k3k-watcher -n "$K3K_NS" 2>/dev/null && log "  ServiceAccount deleted" || warn "  ServiceAccount not found"
 
-# --- Step 2: Remove host ingress resources ---
-log "Step 2/6: Removing host cluster ingress resources..."
-kubectl delete ingress rancher-k3k-ingress -n "$K3K_NS" 2>/dev/null && log "  Ingress deleted" || warn "  Ingress not found"
-kubectl delete svc rancher-k3k-traefik -n "$K3K_NS" 2>/dev/null && log "  Service deleted" || warn "  Service not found"
-kubectl delete secret tls-rancher-ingress -n "$K3K_NS" 2>/dev/null && log "  TLS secret deleted" || warn "  TLS secret not found"
+# --- Step 2: Remove legacy host resources (from pre-native-sync deployments) ---
+log "Step 2/6: Cleaning up legacy host resources..."
+kubectl delete ingress rancher-ingress -n "$K3K_NS" --ignore-not-found 2>/dev/null && log "  Rancher ingress removed" || true
+kubectl delete ingress rancher-k3k-ingress -n "$K3K_NS" --ignore-not-found 2>/dev/null && log "  Legacy ingress removed" || true
+kubectl delete svc rancher-traefik -n "$K3K_NS" --ignore-not-found 2>/dev/null && log "  Rancher traefik service removed" || true
+kubectl delete svc rancher-k3k-traefik -n "$K3K_NS" --ignore-not-found 2>/dev/null && log "  Legacy service removed" || true
+kubectl delete cronjob ingress-reconciler -n "$K3K_NS" --ignore-not-found 2>/dev/null && log "  Legacy CronJob removed" || true
+kubectl delete secret tls-rancher-ingress -n "$K3K_NS" --ignore-not-found 2>/dev/null && log "  Legacy TLS secret removed" || true
+# Legacy watcher/reconciler resources (old names)
+kubectl delete deploy ingress-watcher -n "$K3K_NS" --ignore-not-found 2>/dev/null || true
+kubectl delete rolebinding ingress-reconciler -n "$K3K_NS" --ignore-not-found 2>/dev/null || true
+kubectl delete role ingress-reconciler -n "$K3K_NS" --ignore-not-found 2>/dev/null || true
+kubectl delete serviceaccount ingress-reconciler -n "$K3K_NS" --ignore-not-found 2>/dev/null || true
 
 # --- Step 3: Delete virtual cluster ---
 log "Step 3/6: Deleting k3k virtual cluster..."

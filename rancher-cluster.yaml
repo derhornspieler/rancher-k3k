@@ -40,10 +40,11 @@ spec:
     storageRequestSize: __PVC_SIZE__
 
   # Disable network policy controller (stale node IP crash on reschedule)
-  # Disable Traefik (host NGINX handles ingress via native sync)
+  # Traefik stays enabled: it routes traffic from k3k-rancher-service:443
+  # to the Rancher app inside the vCluster based on Host header/SNI.
+  # The host NGINX ingress terminates external TLS and proxies to Traefik.
   serverArgs:
     - "--disable-network-policy"
-    - "--disable=traefik"
 __EXTRA_SERVER_ARGS__
 
 __SECRET_MOUNTS__
@@ -60,11 +61,10 @@ __SECRET_MOUNTS__
 __TLS_SANS__
 
   # Sync resources from vCluster to host cluster
-  # Ingresses + services enabled: replaces manual host-ingress.yaml and rancher-k3k-traefik service
-  sync:
-    ingresses:
-      enabled: true
-    services:
-      enabled: true
+  # Note: ingress sync is not yet functional in k3k v1.0.2 — Rancher ingress
+  # is created manually by deploy.sh (Step 5.6). Service sync is also unused;
+  # the host ingress routes directly to k3k-rancher-service (the k3k API service
+  # which forwards to the vCluster). Keep defaults for future k3k versions.
+  sync: {}
 
 __CUSTOM_CAS__
