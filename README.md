@@ -345,6 +345,8 @@ rancher-k3k/
 │   ├── s3-credentials.yaml
 │   └── encryption-config.yaml
 ├── docs/                    # Operational documentation
+│   ├── runbooks/
+│   │   └── k3k-rancher-recovery.md     # Full recovery runbook (all scenarios)
 │   ├── universal-backup-restore.md
 │   ├── backup-restore.md
 │   ├── certificate-change-recovery.md
@@ -400,6 +402,14 @@ for private CA and container registry support.
 - [harvester/harvester#6360](https://github.com/harvester/harvester/issues/6360) -- Dashboard 404 after upgrade (ingress-nginx changes)
 
 ## Troubleshooting
+
+**For comprehensive recovery procedures**, see the [k3k Rancher Recovery Runbook](docs/runbooks/k3k-rancher-recovery.md).
+It covers:
+
+- Etcd quorum deadlock detection and recovery
+- Automated recovery failure diagnosis and manual remediation
+- Corrupted etcd data recovery using MinIO backups
+- Post-recovery verification and health checks
 
 ### Cluster not starting
 
