@@ -983,9 +983,53 @@ kubectl -n "$K3K_NS" create secret tls tls-rancher-ingress \
 log "TLS certificate copied to host cluster"
 
 # =============================================================================
-# Step 5.6: Create host ingress for Rancher
+# Step 5.6: Migrate legacy resources (from pre-native-sync deployments)
 # =============================================================================
-log "Step 5.6: Creating host cluster ingress for Rancher..."
+# Previous versions used different resource names. Clean up old resources
+# to prevent routing conflicts and duplicate reconciliation loops.
+# Uses --ignore-not-found so this is a no-op on fresh deployments.
+LEGACY_CLEANED=false
+
+# Old ingress/service (rancher-k3k-ingress → rancher-ingress, rancher-k3k-traefik → rancher-traefik)
+if kubectl get ingress rancher-k3k-ingress -n "$K3K_NS" &>/dev/null; then
+    log "Migrating: removing legacy ingress rancher-k3k-ingress..."
+    kubectl delete ingress rancher-k3k-ingress -n "$K3K_NS" --ignore-not-found
+    LEGACY_CLEANED=true
+fi
+if kubectl get svc rancher-k3k-traefik -n "$K3K_NS" &>/dev/null; then
+    log "Migrating: removing legacy service rancher-k3k-traefik..."
+    kubectl delete svc rancher-k3k-traefik -n "$K3K_NS" --ignore-not-found
+    LEGACY_CLEANED=true
+fi
+
+# Old watcher/reconciler (ingress-watcher → k3k-watcher, ingress-reconciler CronJob removed)
+if kubectl get deploy ingress-watcher -n "$K3K_NS" &>/dev/null; then
+    log "Migrating: removing legacy ingress-watcher deployment..."
+    kubectl delete deploy ingress-watcher -n "$K3K_NS" --ignore-not-found
+    LEGACY_CLEANED=true
+fi
+if kubectl get cronjob ingress-reconciler -n "$K3K_NS" &>/dev/null; then
+    log "Migrating: removing legacy ingress-reconciler CronJob..."
+    kubectl delete cronjob ingress-reconciler -n "$K3K_NS" --ignore-not-found
+    LEGACY_CLEANED=true
+fi
+
+# Old RBAC resources (ingress-reconciler → k3k-watcher)
+for RESOURCE in "rolebinding/ingress-reconciler" "role/ingress-reconciler" "sa/ingress-reconciler"; do
+    if kubectl get "$RESOURCE" -n "$K3K_NS" &>/dev/null; then
+        kubectl delete "$RESOURCE" -n "$K3K_NS" --ignore-not-found
+        LEGACY_CLEANED=true
+    fi
+done
+
+if $LEGACY_CLEANED; then
+    log "Legacy resource migration complete"
+fi
+
+# =============================================================================
+# Step 5.7: Create host ingress for Rancher
+# =============================================================================
+log "Step 5.7: Creating host cluster ingress for Rancher..."
 
 # Create a service targeting Traefik (port 443) inside the k3k server pods.
 # k3k-rancher-service maps to port 6443 (k3s API); Traefik listens on 443.
