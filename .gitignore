@@ -1,0 +1,45 @@
+# Kubeconfig (never commit)
+kubeconfig*
+*.kubeconfig
+merged.*
+
+# Terraform (never commit)
+*.tfvars
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+
+# Certificates and keys (never commit)
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+
+# Backups (local state)
+backups/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Deploy config (contains real hostnames, passwords, CA paths)
+deploy.conf
+
+# Claude
+.claude/
+
+# Superpowers plans (local planning docs)
+docs/superpowers/
+
+# scripts/ is intentionally tracked — local sync tooling lives here.
+# These files are excluded from the public GitHub mirror by
+# scripts/sync-to-github.sh (rm -rf scripts/ before scrubbing).

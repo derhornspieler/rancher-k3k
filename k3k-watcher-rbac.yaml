@@ -1,0 +1,58 @@
+---
+# RBAC for the k3k-watcher deployment.
+# Provides permissions for etcd quorum recovery and HA pod rebalancing.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k3k-watcher
+  namespace: rancher-k3k
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k3k-watcher
+  namespace: rancher-k3k
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["k3k.io"]
+    resources: ["clusters"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k3k-watcher
+  namespace: rancher-k3k
+subjects:
+  - kind: ServiceAccount
+    name: k3k-watcher
+    namespace: rancher-k3k
+roleRef:
+  kind: Role
+  name: k3k-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k3k-watcher-nodes
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k3k-watcher-nodes
+subjects:
+  - kind: ServiceAccount
+    name: k3k-watcher
+    namespace: rancher-k3k
+roleRef:
+  kind: ClusterRole
+  name: k3k-watcher-nodes
+  apiGroup: rbac.authorization.k8s.io

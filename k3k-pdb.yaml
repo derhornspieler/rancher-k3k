@@ -1,0 +1,26 @@
+---
+# Protects the k3k-hosted Rancher vCluster server pods from simultaneous
+# eviction during Harvester node drains and version upgrades. Without this,
+# a rolling Harvester upgrade can evict 2 of 3 server pods at once, losing
+# etcd quorum inside the vCluster and taking Rancher offline (observed
+# during Harvester v1.7.1 upgrade with concurrent KubeOVN experiment).
+#
+# Placeholders (__K3K_NS__, __K3K_CLUSTER__) are substituted by deploy.sh.
+#
+# Note on k3k-controller: no PDB is needed. Upstream k3k (v1.0.2 through
+# main branch) does not implement controller-runtime leader election, so
+# controller.replicas must stay at 1. The controller is stateless — if its
+# pod is evicted or its node drained, running vCluster server pods and
+# Rancher itself are unaffected; only new reconciles pause until the
+# controller reschedules (~30–60s). See docs/upstream-tracking.md.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: k3k-rancher-server
+  namespace: __K3K_NS__
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      cluster: __K3K_CLUSTER__
+      role: server
